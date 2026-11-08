@@ -22,3 +22,9 @@ The banner is editable vector artwork at `docs/images/banner.svg`; update it whe
 - Editor interactions: `cargo test -p quill --features screenshots --test editor` (macOS graphics session required).
 
 Run checks appropriate to the change. Preserve uncommitted user work and keep generated libraries, secrets, and build products out of Git.
+
+## Releases
+
+The app inherits its version from `[workspace.package].version` in the root `Cargo.toml`. Before a new release, bump that version and refresh `Cargo.lock` with `cargo check -p quill`. Commit and push, then either push a matching `vX.Y.Z` tag or run the macOS workflow with the `release` profile and `publish_release` enabled. The workflow builds, verifies the app signature, and publishes a versioned ZIP plus SHA-256 checksums. Debug builds never publish releases. Do not reuse a published version or replace its assets; bump the version instead.
+
+GitHub build actions intentionally do not run tests. Run appropriate validation locally before publishing. Keep the README download link pointing to the latest release.

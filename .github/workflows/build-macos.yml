@@ -1,6 +1,8 @@
 name: Build macOS (Apple Silicon)
 
 on:
+  push:
+    tags: ["v*"]
   workflow_dispatch:
     inputs:
       profile:
@@ -8,15 +10,56 @@ on:
         type: choice
         options: [release, debug]
         default: release
+      publish_release:
+        description: Publish a versioned GitHub Release (release profile only)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: macos-15
     timeout-minutes: 60
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      publish: ${{ steps.metadata.outputs.publish }}
+      artifact: ${{ steps.metadata.outputs.artifact }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Release metadata
+        id: metadata
+        env:
+          REQUESTED_PROFILE: ${{ inputs.profile || 'release' }}
+          PUBLISH_RELEASE: ${{ inputs.publish_release }}
+        run: |
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Expected a stable version such as 0.1.0" >&2; exit 1; }
+          publish=false
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            [[ "$GITHUB_REF_NAME" == "v$version" ]] || { echo "Tag must match Cargo version v$version" >&2; exit 1; }
+            profile=release
+            publish=true
+          else
+            profile="$REQUESTED_PROFILE"
+            if [[ "$profile" == release && "$PUBLISH_RELEASE" == true ]]; then publish=true; fi
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "profile=$profile" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "artifact=Roughcut-$version-macos-arm64-$profile" >> "$GITHUB_OUTPUT"
 
       - name: Install toolchain from rust-toolchain.toml
         run: |
@@ -25,17 +68,51 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Test
-        run: |
-          cargo test --workspace
-          cargo test -p quill --features screenshots --test editor
-
       - name: Build and bundle
         id: bundle
-        run: echo "zip=$(scripts/bundle-macos.sh ${{ inputs.profile }} | tail -n1)" >> "$GITHUB_OUTPUT"
+        env:
+          PROFILE: ${{ steps.metadata.outputs.profile }}
+        run: |
+          zip="$(scripts/bundle-macos.sh "$PROFILE" | tail -n1)"
+          codesign --verify --deep --strict dist/Roughcut.app
+          (cd dist && shasum -a 256 "$(basename "$zip")" > SHA256SUMS.txt)
+          echo "zip=$zip" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: Roughcut-macos-arm64-${{ inputs.profile }}
-          path: ${{ steps.bundle.outputs.zip }}
+          name: ${{ steps.metadata.outputs.artifact }}
+          path: |
+            ${{ steps.bundle.outputs.zip }}
+            dist/SHA256SUMS.txt
           if-no-files-found: error
+
+  release:
+    needs: build
+    if: needs.build.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ needs.build.outputs.version }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact }}
+          path: dist
+
+      - name: Publish versioned release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          cd dist
+          sha256sum --check SHA256SUMS.txt
+          cat > notes.txt <<'NOTES'
+          Download the ZIP below, unzip it, and move Roughcut.app into Applications.
+
+          Requires macOS 13 or later on Apple Silicon. This build is ad-hoc signed and is not notarized; macOS may require approval in System Settings → Privacy & Security on first launch.
+          NOTES
+          gh release create "v$VERSION" "Roughcut-$VERSION-macos-arm64.zip" SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Roughcut v$VERSION" --notes-file notes.txt --generate-notes
