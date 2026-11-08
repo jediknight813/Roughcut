@@ -13,7 +13,3 @@ cargo run -p quill
 | ![Document editor](docs/images/page.png) | ![Creative whiteboard](docs/images/board.png) |
 | Library | Focus |
 | ![Document library](docs/images/library.png) | ![Distraction-free writing](docs/images/focus.png) |
-
-Build the app: `bash scripts/bundle-macos.sh release`.
-
-Refresh screenshots: `python3 scripts/capture-readme.py` (macOS; disposable demo library).

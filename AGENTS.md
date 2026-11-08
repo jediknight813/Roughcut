@@ -25,6 +25,8 @@ Run checks appropriate to the change. Preserve uncommitted user work and keep ge
 
 ## Releases
 
+Build a local app bundle with `bash scripts/bundle-macos.sh release` on macOS. The app and versioned ZIP are written to `dist/`.
+
 The app inherits its version from `[workspace.package].version` in the root `Cargo.toml`. Before a new release, bump that version and refresh `Cargo.lock` with `cargo check -p quill`. Commit and push, then either push a matching `vX.Y.Z` tag or run the macOS workflow with the `release` profile and `publish_release` enabled. The workflow builds, verifies the app signature, and publishes a versioned ZIP plus SHA-256 checksums. Debug builds never publish releases. Do not reuse a published version or replace its assets; bump the version instead.
 
 GitHub build actions intentionally do not run tests. Run appropriate validation locally before publishing. Keep the README download link pointing to the latest release.
