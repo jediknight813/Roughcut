@@ -1,0 +1,39 @@
+name: Build macOS (Apple Silicon)
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Cargo profile
+        type: choice
+        options: [release, debug]
+        default: release
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install toolchain from rust-toolchain.toml
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --workspace --exclude quill
+
+      - name: Build and bundle
+        id: bundle
+        run: echo "zip=$(scripts/bundle-macos.sh ${{ inputs.profile }} | tail -n1)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Quill-macos-arm64-${{ inputs.profile }}
+          path: ${{ steps.bundle.outputs.zip }}
+          if-no-files-found: error
