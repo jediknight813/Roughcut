@@ -704,6 +704,7 @@ impl EditorView {
 
     fn media_card(&self, compact: bool, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let now = self.media.read(cx).now.clone()?;
+        let artwork = self.media.read(cx).artwork();
         let control = |id: &'static str, label: &'static str, control: Control, media: Entity<Media>| {
             div()
                 .id(id)
@@ -729,6 +730,12 @@ impl EditorView {
                 .border_1()
                 .border_color(theme::border())
                 .shadow_lg()
+                .when(!compact, |d| {
+                    d.child(match artwork {
+                        Some(image) => img(image).size(px(44.)).rounded(px(8.)).into_any_element(),
+                        None => div().size(px(44.)).rounded(px(8.)).bg(theme::selected_bg()).into_any_element(),
+                    })
+                })
                 .when(!compact, |d| {
                     d.child(
                         div()

@@ -10,3 +10,4 @@ jiff = "0.2.40"
 quill-doc = { version = "0.1.0", path = "../quill-doc" }
 quill-import = { version = "0.1.0", path = "../quill-import" }
 quill-store = { version = "0.1.0", path = "../quill-store" }
+ureq = { version = "3.5.1", default-features = false, features = ["rustls"] }
