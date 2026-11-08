@@ -2,7 +2,7 @@
 //! PNG of each, rendered offscreen (no Screen Recording permission needed).
 //!
 //! ```sh
-//! QUILL_HOME=/tmp/q QUILL_DEMO=1 QUILL_SCREENSHOTS=/tmp/shots cargo run -p quill --features screenshots
+//! ROUGHCUT_HOME=/tmp/q ROUGHCUT_DEMO=1 ROUGHCUT_SCREENSHOTS=/tmp/shots cargo run -p quill --features screenshots
 //! ```
 
 use std::path::PathBuf;
@@ -11,9 +11,9 @@ use std::time::Duration;
 use gpui_kit::*;
 
 use crate::editor::Mode;
-use crate::{QuillApp, Screen};
+use crate::{RoughcutApp, Screen};
 
-type Step = (&'static str, fn(&mut QuillApp, &mut Window, &mut Context<QuillApp>));
+type Step = (&'static str, fn(&mut RoughcutApp, &mut Window, &mut Context<RoughcutApp>));
 
 /// Long enough for entrance animations to settle.
 const SETTLE: Duration = Duration::from_millis(1100);
@@ -46,7 +46,7 @@ const STEPS: &[Step] = &[
     }),
 ];
 
-pub fn run(window: AnyWindowHandle, app: Entity<QuillApp>, dir: PathBuf, cx: &mut App) {
+pub fn run(window: AnyWindowHandle, app: Entity<RoughcutApp>, dir: PathBuf, cx: &mut App) {
     std::fs::create_dir_all(&dir).expect("screenshot directory");
     cx.spawn(async move |cx| {
         for (name, step) in STEPS {
@@ -57,10 +57,10 @@ pub fn run(window: AnyWindowHandle, app: Entity<QuillApp>, dir: PathBuf, cx: &mu
                 Ok(Ok(image)) => {
                     let path = dir.join(format!("{name}.png"));
                     if let Err(err) = image.save(&path) {
-                        eprintln!("quill: saving {} failed: {err}", path.display());
+                        eprintln!("roughcut: saving {} failed: {err}", path.display());
                     }
                 }
-                Ok(Err(err)) | Err(err) => eprintln!("quill: capturing {name} failed: {err}"),
+                Ok(Err(err)) | Err(err) => eprintln!("roughcut: capturing {name} failed: {err}"),
             }
         }
         cx.update(|cx| cx.quit());

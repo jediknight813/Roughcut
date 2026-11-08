@@ -1,4 +1,26 @@
 target/
-*.db
-.DS_Store
 dist/
+.DS_Store
+
+# Local document libraries, SQLite sidecars, and backups.
+*.db
+*.db-*
+*.db.*
+*.sqlite
+*.sqlite-*
+*.sqlite.*
+*.sqlite3
+*.sqlite3-*
+*.sqlite3.*
+
+# Local secrets and signing material.
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+*.p12
+*.pfx
+.aws/
+.ssh/

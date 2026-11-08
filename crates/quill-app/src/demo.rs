@@ -1,12 +1,10 @@
-//! Sample library for screenshots and first-look demos (`QUILL_DEMO=1` with an
+//! Sample library for screenshots and first-look demos (`ROUGHCUT_DEMO=1` with an
 //! empty library): a handful of documents across collections, three months
 //! of writing history, and a whiteboard full of notes.
 
 use jiff::ToSpan;
 use quill_doc::{Block, BlockKind, Document, Marks, Pos};
 use quill_store::{ItemKind, Library};
-
-use crate::board::NOTE_COLORS;
 
 fn doc(title: &str, blocks: &[(BlockKind, &str)]) -> Document {
     Document { title: title.into(), blocks: blocks.iter().map(|(k, t)| Block::new(*k, t)).collect() }
@@ -161,7 +159,7 @@ pub fn seed(library: &mut Library) -> quill_store::Result<()> {
         30.,
         200.,
         150.,
-        ItemKind::Sticky { text: "Elias finds the box in ch. 2, not ch. 3".into(), color: NOTE_COLORS[0] },
+        ItemKind::Text { text: "Elias finds the box in ch. 2, not ch. 3".into(), style: Default::default() },
     )?;
     library.add_item(
         id,
@@ -169,7 +167,7 @@ pub fn seed(library: &mut Library) -> quill_store::Result<()> {
         260.,
         190.,
         140.,
-        ItemKind::Sticky { text: "The reef keeps coming back. Guilt?".into(), color: NOTE_COLORS[1] },
+        ItemKind::Text { text: "The reef keeps coming back. Guilt?".into(), style: Default::default() },
     )?;
     library.add_item(
         id,
@@ -177,7 +175,7 @@ pub fn seed(library: &mut Library) -> quill_store::Result<()> {
         60.,
         210.,
         150.,
-        ItemKind::Sticky { text: "First-order Fresnel lens — taller than a man".into(), color: NOTE_COLORS[2] },
+        ItemKind::Text { text: "First-order Fresnel lens — taller than a man".into(), style: Default::default() },
     )?;
     library.add_item(
         id,
@@ -185,7 +183,7 @@ pub fn seed(library: &mut Library) -> quill_store::Result<()> {
         300.,
         200.,
         160.,
-        ItemKind::Sticky { text: "To do\n– name the gull\n– fix the timeline".into(), color: NOTE_COLORS[3] },
+        ItemKind::Text { text: "To do\n– name the gull\n– fix the timeline".into(), style: Default::default() },
     )?;
     library.add_item(
         id,
@@ -193,7 +191,10 @@ pub fn seed(library: &mut Library) -> quill_store::Result<()> {
         520.,
         230.,
         90.,
-        ItemKind::Text { text: "“The sea doesn’t care who’s watching.” — maybe the last line".into() },
+        ItemKind::Text {
+            text: "“The sea doesn’t care who’s watching.” — maybe the last line".into(),
+            style: Default::default(),
+        },
     )?;
     let arc: Vec<(f32, f32)> = (0..=20)
         .map(|i| {

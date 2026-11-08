@@ -1,6 +1,6 @@
 //! The import screen: pick or drop files, folders or a Takeout zip; each
 //! supported file becomes a library document. Comments in the source become
-//! sticky notes beside the page.
+//! board text beside the page.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -14,7 +14,6 @@ use quill_store::{ItemKind, Library};
 
 use crate::anim;
 use crate::assets::icon;
-use crate::board::NOTE_COLORS;
 use crate::editor::icon_button;
 use crate::home::button;
 use crate::theme;
@@ -99,9 +98,9 @@ impl ImportView {
         // Comments line up down the left side of the page.
         let x = -(crate::page::TEXT_WIDTH / 2. + 80. + 260.);
         for (i, note) in imported.notes.iter().enumerate() {
-            let kind = ItemKind::Sticky { text: note.clone(), color: NOTE_COLORS[i % NOTE_COLORS.len()] };
+            let kind = ItemKind::Text { text: note.clone(), style: Default::default() };
             if let Err(err) = library.add_item(id, x, 40. + i as f32 * 170., 200., 150., kind) {
-                eprintln!("quill: adding a comment note failed: {err}");
+                eprintln!("roughcut: adding a comment note failed: {err}");
             }
         }
         Row { source, status: Status::Imported { notes: imported.notes.len() } }
@@ -203,7 +202,7 @@ impl Render for ImportView {
                                 .child(
                                     div()
                                         .text_color(theme::muted())
-                                        .child("Word, OpenDocument, Markdown, RTF, HTML and text files, whole folders, or a Google Takeout zip."),
+                                        .child("Word, OpenDocument, Markdown, RTF, HTML and text files, whole folders, or ZIP archives."),
                                 ),
                         )
                         .child(
@@ -275,8 +274,8 @@ impl Render for ImportView {
                                 .child(div().h(px(1.)).bg(theme::border()))
                                 .child(self.toggle(
                                     "opt-notes",
-                                    "Comments become sticky notes",
-                                    "Comments from Word and Google Docs appear beside the page.",
+                                    "Comments become board text",
+                                    "Imported document comments appear beside the page.",
                                     self.options.comments_as_notes,
                                     cx,
                                     |o| o.comments_as_notes = !o.comments_as_notes,

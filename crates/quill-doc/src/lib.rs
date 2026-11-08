@@ -52,11 +52,39 @@ pub struct Span {
 pub struct Block {
     pub kind: BlockKind,
     pub spans: Vec<Span>,
+    #[serde(default)]
+    pub style: TextStyle,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Alignment {
+    #[default]
+    Left,
+    Center,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Typeface {
+    #[default]
+    Serif,
+    Sans,
+    Mono,
+}
+
+/// Paragraph and canvas typography. Missing fields preserve older documents.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TextStyle {
+    pub typeface: Typeface,
+    pub size: Option<u16>,
+    pub color: Option<u32>,
+    pub alignment: Alignment,
 }
 
 impl Block {
     pub fn new(kind: BlockKind, text: &str) -> Block {
-        let mut block = Block { kind, spans: Vec::new() };
+        let mut block = Block { kind, spans: Vec::new(), style: TextStyle::default() };
         block.insert(0, text, Marks::NONE);
         block
     }
@@ -71,6 +99,10 @@ impl Block {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    pub fn word_count(&self) -> usize {
+        self.text().unicode_words().count()
     }
 
     /// Marks that text typed at `offset` should inherit: those of the
@@ -116,7 +148,7 @@ impl Block {
             kind => kind,
         };
         self.normalize();
-        Block { kind, spans: tail }
+        Block { kind, spans: tail, style: self.style.clone() }
     }
 
     pub fn append(&mut self, other: Block) {
@@ -222,7 +254,7 @@ impl Document {
     }
 
     pub fn word_count(&self) -> usize {
-        self.blocks.iter().map(|b| b.text().unicode_words().count()).sum()
+        self.blocks.iter().map(Block::word_count).sum()
     }
 
     pub fn end(&self) -> Pos {
@@ -398,6 +430,18 @@ mod tests {
 
     fn texts(doc: &Document) -> Vec<String> {
         doc.blocks.iter().map(Block::text).collect()
+    }
+
+    #[test]
+    fn legacy_blocks_and_paragraph_styles_survive_splitting() {
+        let mut block: Block =
+            serde_json::from_str(r#"{"kind":"Paragraph","spans":[{"text":"Hello world","marks":0}]}"#).unwrap();
+        assert_eq!(block.style, TextStyle::default());
+        block.style =
+            TextStyle { size: Some(24), alignment: Alignment::Center, color: Some(0x7b9af0), typeface: Typeface::Sans };
+        let tail = block.split_off(5);
+        assert_eq!(tail.style, block.style);
+        assert_eq!(serde_json::from_str::<Block>(&serde_json::to_string(&tail).unwrap()).unwrap(), tail);
     }
 
     #[test]

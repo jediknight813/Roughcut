@@ -12,7 +12,7 @@ impl Builder {
     /// Ends the current block (if any) and starts a new one.
     pub fn start(&mut self, kind: BlockKind) {
         self.end();
-        self.current = Some(Block { kind, spans: Vec::new() });
+        self.current = Some(Block { kind, spans: Vec::new(), ..Block::default() });
     }
 
     /// Changes the kind of the current block without ending it.

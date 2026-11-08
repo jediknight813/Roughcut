@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 use gpui_kit::Window;
 
 /// Apple's standard motion: quick start, long soft landing.
-pub const STANDARD: Duration = Duration::from_millis(420);
-pub const QUICK: Duration = Duration::from_millis(220);
+pub const STANDARD: Duration = Duration::from_millis(300);
+pub const QUICK: Duration = Duration::from_millis(160);
 
 #[derive(Clone, Copy, Debug)]
 pub struct Tween {
@@ -24,6 +24,12 @@ impl Tween {
     }
 
     pub fn set(&mut self, to: f32, duration: Duration) {
+        if duration.is_zero() {
+            self.from = to;
+            self.to = to;
+            self.duration = Duration::ZERO;
+            return;
+        }
         if (to - self.to).abs() < f32::EPSILON {
             return;
         }
@@ -83,5 +89,8 @@ mod tests {
         assert!(t.value() <= 1. && t.value() > 0.9);
         t.set(0., Duration::from_secs(1));
         assert_eq!(t.target(), 0., "same target keeps the running animation");
+        t.set(0., Duration::ZERO);
+        assert_eq!(t.value(), 0., "direct gestures settle even when the target is unchanged");
+        assert!(!t.animating());
     }
 }

@@ -157,7 +157,7 @@ fn walk_html(el: ElementRef<'_>, b: &mut Builder, marks: Marks, lists: &mut Vec<
     }
 }
 
-/// Inline CSS as exported by Google Docs and most word processors.
+/// Inline CSS exported by word processors.
 fn style_marks(style: &str, mut marks: Marks) -> Marks {
     for decl in style.split(';') {
         let Some((prop, value)) = decl.split_once(':') else { continue };
@@ -233,7 +233,7 @@ mod tests {
     }
 
     #[test]
-    fn html_with_google_docs_inline_styles() {
+    fn html_with_inline_styles() {
         let src = r#"<html><head><style>p{}</style></head><body>
             <h1>Story</h1>
             <p><span style="font-weight:700">Bold</span> then <span style="font-style:italic">slanted</span></p>

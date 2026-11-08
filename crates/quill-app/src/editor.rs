@@ -5,8 +5,7 @@
 //!
 //! The page sits on a whiteboard (see `board.rs`). In Board mode the whole
 //! canvas zooms out so notes and drawings sit around a smaller page; clicking
-//! the page glides it back to full size for writing, with the board fading
-//! behind. Focus mode hides everything but the text and dims every
+//! the page glides it back to full size for writing. Focus mode hides everything but the text and dims every
 //! paragraph except the current one.
 
 use std::cell::RefCell;
@@ -25,21 +24,24 @@ use quill_store::{AssetId, BoardItem, DocId, ItemId, Library, Revision};
 
 use crate::anim::{self, Tween};
 use crate::assets::icon;
-use crate::board::{Editing, Gesture, NOTE_COLORS, Tool};
+use crate::board::{BOARD_COLORS, Editing, Gesture, Tool};
 use crate::media::{Control, Media};
-use crate::page::{PageElement, PageLayout, TEXT_WIDTH};
+use crate::page::{LayoutCache, LayoutState, PageElement, PageLayout, TEXT_WIDTH};
 use crate::theme;
 
+#[path = "formatting.rs"]
+pub(crate) mod formatting;
+
 const COMMIT_AFTER: Duration = Duration::from_millis(800);
+const MAX_UNSAVED: Duration = Duration::from_secs(5);
 const BLINK: Duration = Duration::from_millis(530);
+const SPELL_AFTER: Duration = Duration::from_millis(180);
 /// Distance from the top of the board to the top of the page.
 pub const PAGE_TOP: f32 = 48.;
 const PAGE_PADDING: (f32, f32) = (80., 72.);
 const PAGE_MIN_HEIGHT: f32 = 1000.;
 /// How far the canvas zooms out in Board mode.
 const BOARD_ZOOM: f32 = 0.78;
-/// How visible the board stays while writing.
-const BOARD_DIMMED: f32 = 0.3;
 const HISTORY_WIDTH: f32 = 300.;
 const HISTORY_SHOWN: usize = 400;
 const DOT_SPACING: f32 = 24.;
@@ -157,6 +159,7 @@ struct SpellMenu {
     range: Range<usize>,
     word: String,
     suggestions: Vec<String>,
+    loading: bool,
     at: Point<Pixels>,
 }
 
@@ -178,22 +181,35 @@ pub struct EditorView {
     goal_x: Option<Pixels>,
     selecting: bool,
     pending: Option<EditKind>,
+    pending_since: Option<Instant>,
+    typing_at: Option<Pos>,
     commit_task: Option<Task<()>>,
+    save_error: Option<String>,
+    layout_cache: LayoutCache,
+    layout_revision: u64,
+    block_texts: Vec<Arc<str>>,
+    block_utf16: Vec<usize>,
+    words: usize,
+    reveal_caret: bool,
+    center_page: bool,
+    format_menu: Option<(formatting::FormatMenu, Point<Pixels>)>,
     pub layout: Option<PageLayout>,
     pub caret_on: bool,
     last_activity: Instant,
     _blink: Task<()>,
+    _save_on_quit: Subscription,
 
     pub mode: Mode,
     pub(crate) zoom: Tween,
+    render_scale: f32,
     /// The zoom Board mode returns to; pinching changes it.
     board_zoom: f32,
     scroll: ScrollHandle,
-    pub(crate) board_fade: Tween,
+    focus_scroll: ScrollHandle,
     history_slide: Tween,
     pub(crate) board: Vec<BoardItem>,
     pub(crate) tool: Tool,
-    pub(crate) note_color: u32,
+    pub(crate) board_color: u32,
     /// Window position of the board origin (page top centre), from the last paint.
     pub(crate) board_origin: Point<Pixels>,
     pub(crate) gesture: Option<Gesture>,
@@ -205,7 +221,11 @@ pub struct EditorView {
     speller: Rc<RefCell<Speller>>,
     pub spellcheck: bool,
     /// Misspelled ranges by block text, so unchanged paragraphs aren't rechecked.
-    spell_cache: RefCell<HashMap<String, Vec<Range<usize>>>>,
+    spell_cache: HashMap<Arc<str>, Vec<Range<usize>>>,
+    spell_task: Option<Task<()>>,
+    spell_generation: u64,
+    spell_ready: u64,
+    suggestion_task: Option<Task<()>>,
     /// Words ignored for this session ("Ignore Spelling"), lowercased.
     ignored: HashSet<String>,
     spell_menu: Option<SpellMenu>,
@@ -235,13 +255,26 @@ impl EditorView {
     ) -> EditorView {
         let end = doc.end();
         let session_start_words = doc.word_count();
+        let block_texts: Vec<Arc<str>> = doc.blocks.iter().map(|b| Arc::from(b.text())).collect();
+        let block_utf16 = block_texts.iter().map(|t| t.encode_utf16().count()).collect();
+        // Window teardown and application shutdown must flush the debounce buffer.
+        cx.on_release(|this, _| {
+            this.commit();
+        })
+        .detach();
+        let save_on_quit = cx.on_app_quit(|this, _| {
+            this.commit();
+            async {}
+        });
         let observe_media = cx.observe(&media, |_, _, cx| cx.notify());
         let blink = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(BLINK).await;
                 let alive = this
                     .update(cx, |this, cx| {
-                        let on = this.last_activity.elapsed() < BLINK || !this.caret_on;
+                        let on = this.mode != Mode::Board
+                            && this.anchor == this.head
+                            && (this.last_activity.elapsed() < BLINK || !this.caret_on);
                         if on != this.caret_on {
                             this.caret_on = on;
                             cx.notify();
@@ -264,20 +297,33 @@ impl EditorView {
             goal_x: None,
             selecting: false,
             pending: None,
+            pending_since: None,
+            typing_at: None,
             commit_task: None,
+            save_error: None,
+            layout_cache: LayoutCache::default(),
+            layout_revision: 0,
+            block_texts,
+            block_utf16,
+            words: session_start_words,
+            reveal_caret: false,
+            center_page: true,
+            format_menu: None,
             layout: None,
             caret_on: true,
             last_activity: Instant::now(),
             _blink: blink,
+            _save_on_quit: save_on_quit,
             mode: Mode::Page,
             zoom: Tween::new(1.),
+            render_scale: 1.,
             board_zoom: BOARD_ZOOM,
             scroll: ScrollHandle::new(),
-            board_fade: Tween::new(BOARD_DIMMED),
+            focus_scroll: ScrollHandle::new(),
             history_slide: Tween::new(0.),
             board: Vec::new(),
             tool: Tool::Select,
-            note_color: NOTE_COLORS[0],
+            board_color: BOARD_COLORS[0],
             board_origin: Point::default(),
             gesture: None,
             selected_item: None,
@@ -286,7 +332,11 @@ impl EditorView {
             images: HashMap::new(),
             speller,
             spellcheck: true,
-            spell_cache: RefCell::default(),
+            spell_cache: HashMap::new(),
+            spell_task: None,
+            spell_generation: 0,
+            spell_ready: 0,
+            suggestion_task: None,
             ignored: HashSet::new(),
             spell_menu: None,
             media,
@@ -295,6 +345,7 @@ impl EditorView {
             _observe_media: observe_media,
         };
         editor.reload_board();
+        editor.schedule_spellcheck(Duration::ZERO, cx);
         editor
     }
 
@@ -305,7 +356,7 @@ impl EditorView {
 
     /// Current zoom of the page and board, mid-animation included.
     pub fn page_scale(&self) -> f32 {
-        self.zoom.value()
+        self.render_scale
     }
 
     pub fn dim_except(&self) -> Option<usize> {
@@ -318,41 +369,121 @@ impl EditorView {
         if !self.spellcheck {
             return Vec::new();
         }
-        let speller = self.speller.borrow();
-        let mut cache = self.spell_cache.borrow_mut();
-        if cache.len() > 4000 {
-            cache.clear();
-        }
-        let typing = self.pending == Some(EditKind::Typing) && self.anchor == self.head;
-        self.doc
-            .blocks
+        let typing = self.typing_at == Some(self.head) && self.anchor == self.head;
+        self.block_texts
             .iter()
             .enumerate()
-            .map(|(i, block)| {
-                let text = block.text();
-                let ranges = cache
-                    .entry(text.clone())
-                    .or_insert_with(|| {
-                        speller
-                            .misspellings(&text)
-                            .into_iter()
-                            .filter(|r| !self.ignored.contains(&text[r.clone()].to_lowercase()))
-                            .collect()
-                    })
-                    .clone();
-                ranges
+            .map(|(i, text)| {
+                self.spell_cache
+                    .get(text)
                     .into_iter()
+                    .flatten()
                     .filter(|r| {
                         !(typing && i == self.head.block && r.start <= self.head.offset && self.head.offset <= r.end)
                     })
+                    .filter(|r| !self.ignored.contains(&text[(*r).clone()].to_lowercase()))
+                    .cloned()
                     .collect()
             })
             .collect()
     }
 
+    fn schedule_spellcheck(&mut self, delay: Duration, cx: &mut Context<Self>) {
+        self.spell_generation += 1;
+        self.spell_task = None;
+        if !self.spellcheck {
+            return;
+        }
+        let generation = self.spell_generation;
+        self.spell_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            let Ok((speller, texts)) = this.update(cx, |this, _| {
+                // Keep only current paragraph versions; typing cannot grow this cache indefinitely.
+                let current: HashSet<_> = this.block_texts.iter().cloned().collect();
+                this.spell_cache.retain(|text, _| current.contains(text));
+                let missing: Vec<_> = current.into_iter().filter(|t| !this.spell_cache.contains_key(t)).collect();
+                if missing.is_empty() {
+                    this.spell_ready = generation;
+                }
+                (this.speller.borrow().clone(), missing)
+            }) else {
+                return;
+            };
+            if texts.is_empty() {
+                return;
+            }
+            let checked = cx
+                .background_executor()
+                .spawn(async move {
+                    texts
+                        .into_iter()
+                        .map(|text| {
+                            let ranges = speller.misspellings(&text);
+                            (text, ranges)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if generation != this.spell_generation {
+                    return;
+                }
+                this.spell_cache.extend(checked);
+                this.spell_ready = generation;
+                this.layout_revision += 1;
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    pub(crate) fn shape_page(&mut self, window: &mut Window) -> PageLayout {
+        let mut cache = std::mem::take(&mut self.layout_cache);
+        let typing = self.typing_at.filter(|_| self.anchor == self.head);
+        let page = cache.shape(
+            &self.doc,
+            LayoutState {
+                revision: self.layout_revision,
+                scale: self.page_scale(),
+                dim_except: self.dim_except(),
+                typing,
+            },
+            || self.misspellings(),
+            window,
+        );
+        self.layout_cache = cache;
+        page
+    }
+
+    pub(crate) fn reveal_caret(&mut self, layout: &PageLayout, cx: &mut Context<Self>) {
+        if !self.reveal_caret || self.mode == Mode::Board {
+            return;
+        }
+        self.reveal_caret = false;
+        let Some(at) = layout.point_for_pos(self.head) else { return };
+        let scroll = if self.mode == Mode::Focus { &self.focus_scroll } else { &self.scroll };
+        let bounds = scroll.bounds();
+        let margin = px(32.);
+        let bottom = bounds.bottom() - margin - layout.line_height_at(self.head.block);
+        let top = bounds.top() + margin;
+        let delta = if at.y < top {
+            top - at.y
+        } else if at.y > bottom {
+            bottom - at.y
+        } else {
+            px(0.)
+        };
+        if delta != px(0.) {
+            let offset = scroll.offset();
+            scroll.set_offset(point(offset.x, (offset.y + delta).min(px(0.))));
+            cx.notify();
+        }
+    }
+
     fn on_right_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         cx.stop_propagation();
         self.spell_menu = None;
+        self.typing_at = None;
         if self.mode == Mode::Board {
             return;
         }
@@ -365,10 +496,32 @@ impl EditorView {
             .and_then(|ranges| ranges.iter().find(|r| r.start <= pos.offset && pos.offset <= r.end).cloned());
         if let Some(range) = hit {
             let word = self.doc.blocks[pos.block].text()[range.clone()].to_string();
-            let suggestions = self.speller.borrow().suggestions(&word);
             self.anchor = Pos::new(pos.block, range.start);
             self.head = Pos::new(pos.block, range.end);
-            self.spell_menu = Some(SpellMenu { block: pos.block, range, word, suggestions, at: event.position });
+            self.spell_menu = Some(SpellMenu {
+                block: pos.block,
+                range,
+                word: word.clone(),
+                suggestions: Vec::new(),
+                loading: true,
+                at: event.position,
+            });
+            let speller = self.speller.borrow().clone();
+            self.suggestion_task = Some(cx.spawn(async move |this, cx| {
+                let request = word.clone();
+                let suggestions = cx.background_executor().spawn(async move { speller.suggestions(&request) }).await;
+                this.update(cx, |this, cx| {
+                    if let Some(menu) = &mut this.spell_menu
+                        && menu.word == word
+                        && menu.block == pos.block
+                    {
+                        menu.suggestions = suggestions;
+                        menu.loading = false;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }));
         }
         cx.notify();
     }
@@ -386,22 +539,26 @@ impl EditorView {
         let Some(menu) = self.spell_menu.take() else { return };
         self.speller.borrow_mut().learn(&menu.word);
         if let Err(err) = self.library.borrow_mut().learn_word(&menu.word) {
-            eprintln!("quill: saving a learned word failed: {err}");
+            eprintln!("roughcut: saving a learned word failed: {err}");
         }
-        self.spell_cache.borrow_mut().clear();
+        self.spell_cache.clear();
+        self.layout_revision += 1;
+        self.schedule_spellcheck(Duration::ZERO, cx);
         cx.notify();
     }
 
     fn ignore_spelling(&mut self, cx: &mut Context<Self>) {
         let Some(menu) = self.spell_menu.take() else { return };
         self.ignored.insert(menu.word.to_lowercase());
-        self.spell_cache.borrow_mut().clear();
+        self.layout_revision += 1;
         cx.notify();
     }
 
     fn toggle_spelling(&mut self, cx: &mut Context<Self>) {
         self.spellcheck = !self.spellcheck;
         self.spell_menu = None;
+        self.layout_revision += 1;
+        self.schedule_spellcheck(Duration::ZERO, cx);
         cx.notify();
     }
 
@@ -440,7 +597,7 @@ impl EditorView {
                     .items_center()
                     .text_size(px(13.))
                     .text_color(theme::muted())
-                    .child("No guesses found")
+                    .child(if menu.loading { "Looking for suggestions…" } else { "No guesses found" })
                     .into_any_element(),
             );
         }
@@ -460,6 +617,8 @@ impl EditorView {
                 anchored().position(menu.at).snap_to_window().child(
                     div()
                         .id("spell-menu")
+                        .block_mouse_except_scroll()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .w(px(MENU_WIDTH))
                         .p(px(MENU_PADDING))
                         .rounded(px(10.))
@@ -493,18 +652,19 @@ impl EditorView {
 
     pub(crate) fn set_mode(&mut self, mode: Mode, window: &mut Window, cx: &mut Context<Self>) {
         self.commit();
+        self.center_page = false;
         self.gesture = None;
         if mode != Mode::Board {
             self.stop_editing_item(cx);
             self.selected_item = None;
         }
         self.mode = mode;
-        let (zoom, fade) = match mode {
-            Mode::Board => (self.board_zoom, 1.),
-            Mode::Page | Mode::Focus => (1., BOARD_DIMMED),
+        self.reveal_caret = mode != Mode::Board;
+        let zoom = match mode {
+            Mode::Board => self.board_zoom,
+            Mode::Page | Mode::Focus => 1.,
         };
         self.zoom.set(zoom, anim::STANDARD);
-        self.board_fade.set(fade, anim::STANDARD);
         self.touch();
         window.focus(&self.focus_handle, cx);
         cx.notify();
@@ -519,10 +679,10 @@ impl EditorView {
         if self.mode == Mode::Focus {
             return;
         }
+        self.center_page = false;
         if self.mode == Mode::Page && z < 0.97 {
             self.commit();
             self.mode = Mode::Board;
-            self.board_fade.set(1., anim::STANDARD);
         }
         if self.mode == Mode::Board {
             self.board_zoom = z;
@@ -564,17 +724,23 @@ impl EditorView {
     }
 
     /// Writes the current edit group to the permanent history.
-    pub fn commit(&mut self) {
+    pub fn commit(&mut self) -> bool {
         self.commit_task = None;
-        if self.pending.take().is_none() {
-            return;
+        if self.pending.is_none() {
+            return true;
         }
         if let Err(err) = self.library.borrow_mut().commit(self.id, &self.doc, self.head, quill_store::today()) {
-            eprintln!("quill: saving failed: {err}");
+            eprintln!("roughcut: saving failed: {err}");
+            self.save_error = Some(err.to_string());
+            return false;
         }
+        self.pending = None;
+        self.pending_since = None;
+        self.save_error = None;
         if self.history.is_some() {
             self.history = Some(self.load_history());
         }
+        true
     }
 
     fn edit(&mut self, kind: EditKind, cx: &mut Context<Self>, f: impl FnOnce(&mut Document, Pos, Pos) -> Pos) {
@@ -582,17 +748,35 @@ impl EditorView {
             self.commit();
         }
         let (start, end) = self.selection();
+        let old_len = self.doc.blocks.len();
+        let old_words: usize = self.doc.blocks[start.block..=end.block].iter().map(|b| b.word_count()).sum();
         let pos = f(&mut self.doc, start, end);
+        let new_end = (end.block + self.doc.blocks.len()) - old_len;
+        let changed = &self.doc.blocks[start.block..=new_end];
+        self.words = self.words - old_words + changed.iter().map(|b| b.word_count()).sum::<usize>();
+        self.block_texts.splice(start.block..=end.block, changed.iter().map(|b| Arc::from(b.text())));
+        self.block_utf16.splice(
+            start.block..=end.block,
+            self.block_texts[start.block..=new_end].iter().map(|t| t.encode_utf16().count()),
+        );
+        self.layout_revision += 1;
+        self.reveal_caret = true;
+        self.spell_menu = None;
+        self.suggestion_task = None;
+        self.schedule_spellcheck(SPELL_AFTER, cx);
         self.anchor = pos;
         self.head = pos;
         self.goal_x = None;
         self.pending = Some(kind);
+        self.typing_at = (kind == EditKind::Typing).then_some(pos);
+        let elapsed = self.pending_since.get_or_insert_with(Instant::now).elapsed();
         self.touch();
         if kind == EditKind::Other {
             self.commit();
         } else {
+            let delay = COMMIT_AFTER.min(MAX_UNSAVED.saturating_sub(elapsed));
             self.commit_task = Some(cx.spawn(async move |this, cx| {
-                cx.background_executor().timer(COMMIT_AFTER).await;
+                cx.background_executor().timer(delay).await;
                 this.update(cx, |this, cx| {
                     this.commit();
                     cx.notify();
@@ -612,6 +796,10 @@ impl EditorView {
 
     fn move_to(&mut self, pos: Pos, extend: bool, cx: &mut Context<Self>) {
         self.commit();
+        self.spell_menu = None;
+        self.typing_at = None;
+        self.suggestion_task = None;
+        self.reveal_caret = true;
         self.head = pos;
         if !extend {
             self.anchor = pos;
@@ -636,13 +824,7 @@ impl EditorView {
         let Some(layout) = &self.layout else { return };
         let Some(at) = layout.point_for_pos(self.head) else { return };
         let x = *self.goal_x.get_or_insert(at.x);
-        let lh = layout.line_height_at(self.head.block);
-        let target = if down { point(x, at.y + lh + lh / 2.) } else { point(x, at.y - lh / 2.) };
-        let pos = if !down && self.head.block == 0 && target.y < layout.blocks[0].origin.y {
-            Pos::default()
-        } else {
-            layout.pos_for_point(target)
-        };
+        let pos = layout.adjacent_row(self.head, down, x);
         self.move_to(pos, extend, cx);
     }
 
@@ -684,7 +866,18 @@ impl EditorView {
         });
     }
 
-    fn toggle(&mut self, mark: Marks, cx: &mut Context<Self>) {
+    fn toggle(&mut self, mark: Marks, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mode == Mode::Board {
+            self.update_board_style(
+                |style| {
+                    style.marks =
+                        if style.marks.contains(mark) { style.marks.without(mark) } else { style.marks.with(mark) }
+                },
+                window,
+                cx,
+            );
+            return;
+        }
         let (start, end) = self.selection();
         if start == end {
             return;
@@ -698,7 +891,21 @@ impl EditorView {
         self.head = head;
     }
 
-    fn set_block_kind(&mut self, kind: BlockKind, cx: &mut Context<Self>) {
+    fn set_block_kind(&mut self, kind: BlockKind, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mode == Mode::Board {
+            self.update_board_style(
+                |style| {
+                    style.typography.size = Some(match kind {
+                        BlockKind::Heading(1) => 32,
+                        BlockKind::Heading(_) => 24,
+                        _ => 16,
+                    });
+                },
+                window,
+                cx,
+            );
+            return;
+        }
         let (anchor, head) = (self.anchor, self.head);
         self.edit(EditKind::Other, cx, |doc, start, end| {
             for block in start.block..=end.block {
@@ -713,6 +920,14 @@ impl EditorView {
 
     /// Marks set on the whole selection (or on the character before the caret).
     fn active_marks(&self) -> Marks {
+        if self.mode == Mode::Board {
+            return self
+                .board
+                .iter()
+                .find(|i| Some(i.id) == self.selected_item)
+                .and_then(|i| i.kind.text())
+                .map_or(Marks::NONE, |(_, s)| s.marks);
+        }
         let (start, end) = self.selection();
         let Some(block) = self.doc.blocks.get(start.block) else { return Marks::NONE };
         if start == end || start.block != end.block {
@@ -725,22 +940,42 @@ impl EditorView {
     }
 
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
-        if self.mode == Mode::Board && self.undo_board(cx) {
+        if self.mode == Mode::Board {
+            if let Some(editing) = &self.editing {
+                editing.state.update(cx, |s, cx| s.history(false, cx));
+            } else {
+                self.undo_board(cx);
+            }
             return;
         }
-        self.commit();
+        if !self.commit() {
+            cx.notify();
+            return;
+        }
         let restored = self.library.borrow_mut().undo(self.id);
         self.apply_history(restored, cx);
     }
 
     fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
-        self.commit();
+        if self.mode == Mode::Board {
+            if let Some(editing) = &self.editing {
+                editing.state.update(cx, |s, cx| s.history(true, cx));
+            }
+            return;
+        }
+        if !self.commit() {
+            cx.notify();
+            return;
+        }
         let restored = self.library.borrow_mut().redo(self.id);
         self.apply_history(restored, cx);
     }
 
     fn checkout(&mut self, rev: quill_store::RevId, cx: &mut Context<Self>) {
-        self.commit();
+        if !self.commit() {
+            cx.notify();
+            return;
+        }
         let restored = self.library.borrow_mut().checkout(self.id, rev).map(Some);
         self.apply_history(restored, cx);
     }
@@ -749,10 +984,19 @@ impl EditorView {
         match restored {
             Ok(Some((doc, cursor))) => {
                 self.doc = doc;
+                self.words = self.doc.word_count();
+                self.block_texts = self.doc.blocks.iter().map(|b| Arc::from(b.text())).collect();
+                self.block_utf16 = self.block_texts.iter().map(|t| t.encode_utf16().count()).collect();
+                self.layout_revision += 1;
+                self.reveal_caret = true;
+                self.spell_menu = None;
+                self.suggestion_task = None;
+                self.schedule_spellcheck(Duration::ZERO, cx);
                 let cursor = self.clamp(cursor);
                 self.anchor = cursor;
                 self.head = cursor;
                 self.marked = None;
+                self.typing_at = None;
                 self.touch();
                 if self.history.is_some() {
                     self.history = Some(self.load_history());
@@ -760,7 +1004,7 @@ impl EditorView {
                 cx.notify();
             }
             Ok(None) => {}
-            Err(err) => eprintln!("quill: history step failed: {err}"),
+            Err(err) => eprintln!("roughcut: history step failed: {err}"),
         }
     }
 
@@ -816,12 +1060,19 @@ impl EditorView {
     }
 
     fn close(&mut self, _: &CloseDocument, _: &mut Window, cx: &mut Context<Self>) {
-        self.commit();
+        if !self.commit() {
+            cx.notify();
+            return;
+        }
         self.stop_editing_item(cx);
         cx.emit(EditorEvent::Close);
     }
 
     fn escape(&mut self, _: &Escape, window: &mut Window, cx: &mut Context<Self>) {
+        if self.format_menu.take().is_some() {
+            cx.notify();
+            return;
+        }
         if self.spell_menu.take().is_some() {
             cx.notify();
             return;
@@ -855,7 +1106,7 @@ impl EditorView {
                 _ => doc.to_markdown(),
             };
             if let Err(err) = std::fs::write(&path, contents) {
-                eprintln!("quill: export to {} failed: {err}", path.display());
+                eprintln!("roughcut: export to {} failed: {err}", path.display());
             }
         })
         .detach();
@@ -866,13 +1117,22 @@ impl EditorView {
         let Some(layout) = &self.layout else { return };
         // Hit-test against the layout the user clicked on, before any zoom.
         let pos = layout.pos_for_point(event.position);
-        if self.mode == Mode::Board {
+        let returning_to_page = self.mode != Mode::Focus
+            && (self.mode == Mode::Board
+                || (self.zoom.target() - 1.).abs() > 0.001
+                || (self.board_origin.x - self.scroll.bounds().center().x).abs() > px(2.));
+        if returning_to_page {
             self.set_mode(Mode::Page, window, cx);
         }
         window.focus(&self.focus_handle, cx);
         self.selecting = true;
         self.goal_x = None;
         self.move_to(pos, event.modifiers.shift, cx);
+        if returning_to_page {
+            self.center_page = true;
+            self.reveal_caret = false;
+            self.selecting = false;
+        }
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -897,22 +1157,27 @@ impl EditorView {
     // plain text (blocks joined by '\n').
 
     fn to_utf16(&self, pos: Pos) -> usize {
-        let text = self.doc.plain_text();
-        text[..self.doc.flat_offset(pos)].encode_utf16().count()
+        self.block_utf16[..pos.block].iter().map(|n| n + 1).sum::<usize>()
+            + self.block_texts[pos.block][..pos.offset].encode_utf16().count()
     }
 
-    fn pos_from_utf16(&self, offset: usize) -> Pos {
-        let text = self.doc.plain_text();
-        let mut units = 0;
-        let mut bytes = 0;
-        for ch in text.chars() {
-            if units >= offset {
-                break;
+    fn pos_from_utf16(&self, mut offset: usize) -> Pos {
+        for (block, &len) in self.block_utf16.iter().enumerate() {
+            if offset <= len {
+                let mut units = 0;
+                let mut bytes = 0;
+                for ch in self.block_texts[block].chars() {
+                    if units >= offset {
+                        break;
+                    }
+                    units += ch.len_utf16();
+                    bytes += ch.len_utf8();
+                }
+                return Pos::new(block, bytes);
             }
-            units += ch.len_utf16();
-            bytes += ch.len_utf8();
+            offset -= len + 1;
         }
-        self.doc.pos_at_flat(bytes)
+        self.doc.end()
     }
 
     fn range_from_utf16(&self, range: &Range<usize>) -> (Pos, Pos) {
@@ -921,26 +1186,7 @@ impl EditorView {
 
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let saving = self.pending.is_some();
-        let segment =
-            |id: &'static str, glyph: &'static str, label: &'static str, mode: Mode, cx: &mut Context<Self>| {
-                let active = self.mode == mode;
-                div()
-                    .id(id)
-                    .h(px(28.))
-                    .px(px(12.))
-                    .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .rounded(px(7.))
-                    .cursor_pointer()
-                    .text_size(px(13.))
-                    .text_color(if active { theme::text() } else { theme::muted() })
-                    .when(active, |d| d.bg(rgb(0x3a3f4b)).shadow_sm())
-                    .when(!active, |d| d.hover(|s| s.text_color(theme::text())))
-                    .child(icon(glyph).size(px(15.)).text_color(if active { theme::text() } else { theme::muted() }))
-                    .child(label)
-                    .on_click(cx.listener(move |this, _, window, cx| this.set_mode(mode, window, cx)))
-            };
+        let save_tip = self.save_error.clone().unwrap_or_else(|| "Changes are saved on this computer.".into());
         div()
             .flex()
             .items_center()
@@ -951,28 +1197,55 @@ impl EditorView {
                 icon_button("library", "chevron-left", "Library (⌘W)", false)
                     .on_click(cx.listener(|this, _, w, cx| this.close(&CloseDocument, w, cx))),
             )
-            .child(div().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).child(self.doc.title.clone()))
             .child(
                 div()
+                    .min_w_0()
+                    .max_w(px(340.))
+                    .text_ellipsis()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_size(px(15.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(self.doc.title.clone()),
+            )
+            .child(
+                div()
+                    .id("save-status")
                     .flex()
                     .items_center()
                     .gap(px(5.))
                     .text_size(px(12.))
-                    .text_color(theme::muted())
-                    .child(icon(if saving { "pen-line" } else { "check" }).size(px(13.)).text_color(theme::muted()))
-                    .child(if saving { "Editing" } else { "Saved" }),
+                    .text_color(if self.save_error.is_some() { rgb(0xfbbf24) } else { theme::muted() })
+                    .child(
+                        icon(if self.save_error.is_some() {
+                            "rotate-ccw"
+                        } else if saving {
+                            "pen-line"
+                        } else {
+                            "check"
+                        })
+                        .size(px(13.))
+                        .text_color(if self.save_error.is_some() {
+                            rgb(0xfbbf24)
+                        } else {
+                            theme::muted()
+                        }),
+                    )
+                    .child(if self.save_error.is_some() {
+                        "Not saved · Retry"
+                    } else if saving {
+                        "Saving…"
+                    } else {
+                        "Saved locally"
+                    })
+                    .when(self.save_error.is_some(), |d| d.cursor_pointer())
+                    .tooltip(move |window, cx| Tooltip::new(save_tip.clone()).build(window, cx))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.commit();
+                        cx.notify();
+                    })),
             )
             .child(div().flex_1())
-            .child(
-                div()
-                    .flex()
-                    .p(px(3.))
-                    .gap(px(2.))
-                    .rounded(px(9.))
-                    .bg(theme::raised())
-                    .child(segment("mode-board", "layers", "Board", Mode::Board, cx))
-                    .child(segment("mode-page", "file-text", "Page", Mode::Page, cx)),
-            )
             .child(
                 icon_button("focus", "scan-text", "Focus mode (⇧⌘F)", false)
                     .on_click(cx.listener(|this, _, window, cx| this.set_mode(Mode::Focus, window, cx))),
@@ -1010,14 +1283,21 @@ impl EditorView {
         let mark_button =
             |id: &'static str, glyph: &'static str, tip: &'static str, mark: Marks, cx: &mut Context<Self>| {
                 icon_button(id, glyph, tip, marks.contains(mark))
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle(mark, cx)))
+                    .on_click(cx.listener(move |this, _, window, cx| this.toggle(mark, window, cx)))
             };
         let kind_button =
             |id: &'static str, glyph: &'static str, tip: &'static str, kind: BlockKind, cx: &mut Context<Self>| {
                 icon_button(id, glyph, tip, block_kind == Some(kind))
-                    .on_click(cx.listener(move |this, _, _, cx| this.set_block_kind(kind, cx)))
+                    .on_click(cx.listener(move |this, _, window, cx| this.set_block_kind(kind, window, cx)))
             };
         div()
+            .id("format-toolbar")
+            .block_mouse_except_scroll()
+            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                window.prevent_default();
+                cx.stop_propagation();
+            })
+            .overflow_x_scroll()
             .flex()
             .items_center()
             .gap(px(2.))
@@ -1045,6 +1325,7 @@ impl EditorView {
             .child(mark_button("underline", "underline", "Underline (⌘U)", Marks::UNDERLINE, cx))
             .child(mark_button("strike", "strikethrough", "Strikethrough (⇧⌘X)", Marks::STRIKE, cx))
             .child(mark_button("highlight", "highlighter", "Highlight (⇧⌘H)", Marks::HIGHLIGHT, cx))
+            .children(self.format_controls(cx))
             .child(div().flex_1())
             .child(
                 icon_button("spelling", "spell-check", "Check spelling (⌥⌘L)", self.spellcheck)
@@ -1055,7 +1336,7 @@ impl EditorView {
                     .px(px(8.))
                     .text_size(px(12.))
                     .text_color(theme::muted())
-                    .child(format!("{} words", crate::home::group(self.doc.word_count() as i64))),
+                    .child(format!("{} words", crate::home::group(self.words as i64))),
             )
     }
 
@@ -1176,7 +1457,20 @@ impl EditorView {
         )
     }
 
-    fn media_card(&self, compact: bool, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    fn media_card(&self, compact: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if let Some(error) = &self.media.read(cx).error {
+            return Some(
+                div()
+                    .max_w(px(360.))
+                    .p(px(12.))
+                    .rounded(px(10.))
+                    .bg(theme::raised())
+                    .text_size(px(12.))
+                    .text_color(theme::text_soft())
+                    .child(error.clone())
+                    .into_any_element(),
+            );
+        }
         let now = self.media.read(cx).now.clone()?;
         let artwork = self.media.read(cx).artwork();
         let control = |id: &'static str, glyph: &'static str, size: f32, control: Control, media: Entity<Media>| {
@@ -1232,13 +1526,11 @@ impl EditorView {
                                     .text_ellipsis()
                                     .child(now.title.clone()),
                             )
-                            .child(
-                                div()
-                                    .text_size(px(12.))
-                                    .text_color(theme::muted())
-                                    .text_ellipsis()
-                                    .child(now.artist.clone()),
-                            )
+                            .child(div().text_size(px(12.)).text_color(theme::muted()).text_ellipsis().child(format!(
+                                "{} · {}",
+                                now.player.name(),
+                                now.artist
+                            )))
                             .child(div().mt(px(7.)).h(px(3.)).rounded(px(2.)).bg(theme::border()).child(
                                 div().h_full().rounded(px(2.)).w(relative(now.progress)).bg(theme::text_soft()),
                             )),
@@ -1256,25 +1548,19 @@ impl EditorView {
                 })
                 .when(!compact, |d| d.child(control("prev", "skip-back", 15., Control::Previous, media.clone())))
                 .child(control("playpause", play, 16., Control::PlayPause, media.clone()))
-                .child(control("next", "skip-forward", 15., Control::Next, media)),
+                .child(control("next", "skip-forward", 15., Control::Next, media))
+                .into_any_element(),
         )
     }
 
     fn page(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let focus = self.mode == Mode::Focus;
-        let z = self.zoom.value();
+        let z = self.page_scale();
         div()
+            .relative()
             .w(px((TEXT_WIDTH + PAGE_PADDING.0 * 2.) * z))
             .min_h(px(PAGE_MIN_HEIGHT * z))
             .px(px(PAGE_PADDING.0 * z))
             .py(px(PAGE_PADDING.1 * z))
-            .when(!focus, |d| {
-                d.bg(theme::page())
-                    .rounded(px(6.))
-                    .border_1()
-                    .border_color(rgb(0x2c303a))
-                    .shadow(page_shadow(self.mode == Mode::Board))
-            })
             .cursor(CursorStyle::IBeam)
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_mouse_down))
@@ -1282,12 +1568,26 @@ impl EditorView {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .child(PageElement { editor: cx.entity() })
+            .when(self.doc.blocks.len() == 1 && self.doc.blocks[0].is_empty(), |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .left(px(PAGE_PADDING.0 * z))
+                        .top(px(PAGE_PADDING.1 * z))
+                        .font_family(theme::PAGE_FONT)
+                        .text_size(px(18. * z))
+                        .line_height(px(28.8 * z))
+                        .text_color(theme::muted())
+                        .opacity(0.65)
+                        .child("Start writing…"),
+                )
+            })
     }
 
     /// How big the board must be (at the current zoom) to hold the page and
     /// every item.
     fn board_extent(&self) -> (f32, f32) {
-        let z = self.zoom.value();
+        let z = self.page_scale();
         let text_h = self.layout.as_ref().map_or(0., |l| f32::from(l.height) / z.max(0.01));
         let page_h = PAGE_MIN_HEIGHT.max(text_h + PAGE_PADDING.1 * 2.);
         let mut half_w = TEXT_WIDTH / 2. + PAGE_PADDING.0;
@@ -1300,7 +1600,7 @@ impl EditorView {
     }
 
     fn render_focus(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let written = self.doc.word_count().saturating_sub(self.session_start_words);
+        let written = self.words.saturating_sub(self.session_start_words);
         div()
             .size_full()
             .flex()
@@ -1323,7 +1623,9 @@ impl EditorView {
                 div()
                     .id("focus-scroll")
                     .flex_1()
+                    .min_h_0()
                     .overflow_y_scroll()
+                    .track_scroll(&self.focus_scroll)
                     .child(div().flex().justify_center().pt(px(40.)).pb(px(160.)).child(self.page(cx))),
             )
             .child(
@@ -1347,6 +1649,41 @@ impl EditorView {
 /// Hooks for the UI integration tests.
 #[doc(hidden)]
 impl EditorView {
+    /// Called after mounting a document so the old library search cannot retain focus.
+    pub fn focus_document(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_mode(Mode::Page, window, cx);
+        self.anchor = Pos::default();
+        self.head = Pos::default();
+        self.center_page = true;
+        self.caret_on = true;
+        cx.notify();
+    }
+
+    /// Use the laid-out canvas origin and viewport, not dimensions from the previous frame.
+    pub(crate) fn record_board_origin(&mut self, origin: Point<Pixels>, cx: &mut Context<Self>) {
+        self.board_origin = origin;
+        if !self.center_page {
+            return;
+        }
+        let viewport = self.scroll.bounds();
+        if viewport.size.width <= px(0.) {
+            return;
+        }
+        self.reveal_caret = false;
+        let offset = self.scroll.offset();
+        let target = point((offset.x + viewport.center().x - origin.x).min(px(0.)), px(0.));
+        if (target.x - offset.x).abs() > px(0.5) || target.y != offset.y {
+            self.scroll.set_offset(target);
+            cx.notify();
+        } else if !self.zoom.animating() {
+            self.center_page = false;
+        }
+    }
+
+    pub fn page_count(&self) -> usize {
+        self.layout.as_ref().map_or(1, |layout| layout.pages)
+    }
+
     /// Window position of a document position, as of the last frame.
     pub fn point_for(&self, pos: Pos) -> Option<Point<Pixels>> {
         self.layout.as_ref()?.point_for_pos(pos)
@@ -1355,12 +1692,41 @@ impl EditorView {
     pub fn spell_menu(&self) -> Option<(String, Vec<String>, Point<Pixels>)> {
         self.spell_menu.as_ref().map(|m| (m.word.clone(), m.suggestions.clone(), m.at))
     }
+
+    pub fn shaped_blocks(&self) -> usize {
+        self.layout_cache.shaped_blocks
+    }
+
+    pub fn word_count(&self) -> usize {
+        self.words
+    }
+
+    pub fn save_error(&self) -> Option<&str> {
+        self.save_error.as_deref()
+    }
+
+    pub fn has_unsaved_changes(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    pub fn spelling_ready(&self) -> bool {
+        !self.spellcheck || self.spell_ready == self.spell_generation
+    }
+
+    pub fn suggestions_ready(&self) -> bool {
+        self.spell_menu.as_ref().is_none_or(|m| !m.loading)
+    }
+
+    pub fn canvas_bounds(&self) -> Bounds<Pixels> {
+        self.scroll.bounds()
+    }
 }
 
 pub(crate) fn icon_button(id: &'static str, glyph: &'static str, tip: &'static str, active: bool) -> Stateful<Div> {
     div()
         .id(id)
         .size(px(32.))
+        .flex_none()
         .flex()
         .items_center()
         .justify_center()
@@ -1395,29 +1761,23 @@ pub(crate) fn floating_shadow() -> Vec<BoxShadow> {
     ]
 }
 
-fn page_shadow(lifted: bool) -> Vec<BoxShadow> {
-    let (y, blur, alpha) = if lifted { (18., 48., 0.5) } else { (8., 28., 0.4) };
-    vec![BoxShadow {
-        color: hsla(0., 0., 0., alpha),
-        offset: point(px(0.), px(y)),
-        blur_radius: px(blur),
-        spread_radius: px(0.),
-        inset: false,
-    }]
-}
-
 /// The board's dot grid, painted across the whole board.
 fn dot_grid(zoom: f32, opacity: f32) -> impl IntoElement {
     canvas(
         |_, _, _| {},
         move |bounds, _, window, _| {
+            if opacity <= 0.01 {
+                return;
+            }
             let step = px(DOT_SPACING * zoom);
             let dot = px(1.6 * zoom.max(0.6));
             let color = hsla(220. / 360., 0.12, 0.32, opacity);
-            let mut y = bounds.top() + step / 2.;
-            while y < bounds.bottom() {
-                let mut x = bounds.left() + step / 2.;
-                while x < bounds.right() {
+            let visible = window.content_mask().bounds.intersect(&bounds);
+            let start = bounds.origin + point(step / 2., step / 2.);
+            let mut y = start.y + step * (f32::from(visible.top() - start.y) / f32::from(step)).ceil().max(0.);
+            while y < visible.bottom() {
+                let mut x = start.x + step * (f32::from(visible.left() - start.x) / f32::from(step)).ceil().max(0.);
+                while x < visible.right() {
                     window.paint_quad(fill(Bounds::new(point(x, y), size(dot, dot)), color).corner_radii(dot / 2.));
                     x += step;
                 }
@@ -1433,7 +1793,7 @@ impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Keep frames coming while anything is mid-animation.
         let zoom = self.zoom.sample(window);
-        let board_fade = self.board_fade.sample(window);
+        self.render_scale = zoom;
 
         let root = div()
             .size_full()
@@ -1469,11 +1829,11 @@ impl Render for EditorView {
             .on_action(cx.listener(Self::enter))
             .on_action(cx.listener(Self::undo))
             .on_action(cx.listener(Self::redo))
-            .on_action(cx.listener(|this, _: &Bold, _, cx| this.toggle(Marks::BOLD, cx)))
-            .on_action(cx.listener(|this, _: &Italic, _, cx| this.toggle(Marks::ITALIC, cx)))
-            .on_action(cx.listener(|this, _: &Underline, _, cx| this.toggle(Marks::UNDERLINE, cx)))
-            .on_action(cx.listener(|this, _: &Strike, _, cx| this.toggle(Marks::STRIKE, cx)))
-            .on_action(cx.listener(|this, _: &Highlight, _, cx| this.toggle(Marks::HIGHLIGHT, cx)))
+            .on_action(cx.listener(|this, _: &Bold, window, cx| this.toggle(Marks::BOLD, window, cx)))
+            .on_action(cx.listener(|this, _: &Italic, window, cx| this.toggle(Marks::ITALIC, window, cx)))
+            .on_action(cx.listener(|this, _: &Underline, window, cx| this.toggle(Marks::UNDERLINE, window, cx)))
+            .on_action(cx.listener(|this, _: &Strike, window, cx| this.toggle(Marks::STRIKE, window, cx)))
+            .on_action(cx.listener(|this, _: &Highlight, window, cx| this.toggle(Marks::HIGHLIGHT, window, cx)))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::paste))
@@ -1492,7 +1852,8 @@ impl Render for EditorView {
             .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.zoom_step(false, cx)))
             .on_action(cx.listener(|this, _: &ZoomReset, _, cx| this.zoom_to(1., None, true, cx)))
             .on_action(cx.listener(|this, _: &ToggleSpelling, _, cx| this.toggle_spelling(cx)))
-            .children(self.spell_menu_element(cx));
+            .children(self.spell_menu_element(cx))
+            .children(self.format_menu_element(cx));
 
         if self.mode == Mode::Focus {
             return root.child(self.render_focus(cx)).into_any_element();
@@ -1500,7 +1861,6 @@ impl Render for EditorView {
 
         let (board_w, board_h) = self.board_extent();
         let history = self.history_panel(window, cx);
-        let tools_lift = 1. - (zoom - BOARD_ZOOM) / (1. - BOARD_ZOOM);
         root.child(
             div()
                 .flex()
@@ -1516,50 +1876,49 @@ impl Render for EditorView {
                 .flex_1()
                 .min_h_0()
                 .flex()
+                .child(self.tool_bar(cx))
                 .child(
-                    div()
-                        .relative()
-                        .flex_1()
-                        .min_w_0()
-                        .h_full()
-                        .child(
-                            div().id("board-scroll").size_full().overflow_scroll().track_scroll(&self.scroll).child(
-                                div()
-                                    .id("board")
-                                    .relative()
-                                    .min_w(px(board_w))
-                                    .w_full()
-                                    .h(px(board_h))
-                                    .when(self.mode == Mode::Board && self.tool != Tool::Select, |d| {
-                                        d.cursor_crosshair()
-                                    })
-                                    .on_mouse_down(MouseButton::Left, cx.listener(Self::board_mouse_down))
-                                    .on_mouse_move(cx.listener(Self::board_mouse_move))
-                                    .on_mouse_up(MouseButton::Left, cx.listener(Self::board_mouse_up))
-                                    .on_pinch(cx.listener(Self::on_pinch))
-                                    .on_scroll(cx.listener(Self::on_scroll_wheel))
-                                    .child(dot_grid(zoom, 0.35 + 0.65 * board_fade))
-                                    .child(div().flex().justify_center().pt(px(PAGE_TOP)).child(self.page(cx)))
-                                    .child(self.render_board(board_fade, cx)),
-                            ),
-                        )
-                        .child(
+                    div().relative().flex_1().min_w_0().h_full().child(
+                        div().id("board-scroll").size_full().overflow_scroll().track_scroll(&self.scroll).child(
                             div()
-                                .absolute()
-                                .bottom(px(18. + 6. * tools_lift))
-                                .left_0()
-                                .right_0()
-                                .flex()
-                                .justify_center()
-                                .child(self.tool_bar(0.82 + 0.18 * tools_lift, cx)),
-                        )
-                        .children(
-                            self.media_card(false, cx)
-                                .map(|card| div().absolute().right(px(16.)).bottom(px(18.)).child(card)),
+                                .id("board")
+                                .relative()
+                                .min_w(px(board_w))
+                                .w_full()
+                                .h(px(board_h))
+                                .when(self.mode == Mode::Board && self.tool != Tool::Select, |d| d.cursor_crosshair())
+                                .on_mouse_down(MouseButton::Left, cx.listener(Self::board_mouse_down))
+                                .on_mouse_move(cx.listener(Self::board_mouse_move))
+                                .on_mouse_up(MouseButton::Left, cx.listener(Self::board_mouse_up))
+                                .on_pinch(cx.listener(Self::on_pinch))
+                                .on_scroll(cx.listener(Self::on_scroll_wheel))
+                                .child(dot_grid(zoom, 1.))
+                                .child(div().flex().justify_center().pt(px(PAGE_TOP)).child(self.page(cx)))
+                                .child(self.render_board(1., window, cx)),
                         ),
+                    ),
                 )
                 .children(history),
         )
+        .children(self.media_card(false, cx).map(|card| {
+            div()
+                .id("media-dock")
+                .flex_none()
+                .flex()
+                .justify_end()
+                .items_center()
+                .px(px(12.))
+                .py(px(8.))
+                .bg(theme::surface())
+                .border_t_1()
+                .border_color(theme::border())
+                .block_mouse_except_scroll()
+                .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                })
+                .child(card)
+        }))
         .into_any_element()
     }
 }

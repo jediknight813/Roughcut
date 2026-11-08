@@ -36,6 +36,6 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: Quill-macos-arm64-${{ inputs.profile }}
+          name: Roughcut-macos-arm64-${{ inputs.profile }}
           path: ${{ steps.bundle.outputs.zip }}
           if-no-files-found: error

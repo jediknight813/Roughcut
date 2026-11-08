@@ -1,17 +1,12 @@
-//! Now-playing for the Spotify desktop app, controlled through AppleScript.
-//! Quill talks to the app already running on this Mac — no account — and
-//! checks that Spotify is running before addressing it, so it never launches
-//! Spotify on its own.
-//!
-//! The one network request in Quill is here: the current track's cover art.
-//! It is fetched only from Spotify's image CDN, over HTTPS with no redirects,
-//! no cookies and a size cap, and nothing about the user or their documents
-//! is sent. Offline or on any failure the player simply shows no art.
+//! Local Spotify and Apple Music/iTunes playback through macOS automation.
+//! Running players are queried without launching them. Artwork is fetched only
+//! from Spotify's HTTPS image CDN; music and document data stay local.
 
 use std::collections::HashMap;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use gpui_kit::*;
 
@@ -22,12 +17,44 @@ const ART_CACHE: usize = 32;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct NowPlaying {
+    pub player: Player,
     pub title: String,
     pub artist: String,
     pub playing: bool,
     /// 0.0..=1.0 through the track.
     pub progress: f32,
     pub artwork_url: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Player {
+    Spotify,
+    Music,
+    ITunes,
+}
+
+impl Player {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Spotify => "Spotify",
+            Self::Music => "Apple Music",
+            Self::ITunes => "iTunes",
+        }
+    }
+    fn application(self) -> &'static str {
+        match self {
+            Self::Spotify => "Spotify",
+            Self::Music => "Music",
+            Self::ITunes => "iTunes",
+        }
+    }
+    fn installed(self) -> bool {
+        let app = format!("{}.app", self.application());
+        [std::path::PathBuf::from("/Applications"), std::path::PathBuf::from("/System/Applications")]
+            .into_iter()
+            .chain(directories::BaseDirs::new().map(|d| d.home_dir().join("Applications")))
+            .any(|dir| dir.join(&app).exists())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -40,6 +67,7 @@ pub enum Control {
 /// App-wide now-playing state; views observe it.
 pub struct Media {
     pub now: Option<NowPlaying>,
+    pub error: Option<String>,
     /// Cover art by URL; `None` marks a URL that failed, so it isn't retried.
     art: HashMap<String, Option<Arc<Image>>>,
     _poll: Task<()>,
@@ -49,10 +77,11 @@ impl Media {
     pub fn new(cx: &mut Context<Self>) -> Media {
         let poll = cx.spawn(async move |this, cx| {
             loop {
-                let now = cx.background_executor().spawn(async { now_playing() }).await;
+                let (now, error) = cx.background_executor().spawn(async { now_playing() }).await;
                 let alive = this
                     .update(cx, |media, cx| {
-                        if media.now != now {
+                        if media.now != now || media.error != error {
+                            media.error = error;
                             media.now = now;
                             media.fetch_art(cx);
                             cx.notify();
@@ -65,12 +94,12 @@ impl Media {
                 cx.background_executor().timer(POLL_EVERY).await;
             }
         });
-        Media { now: None, art: HashMap::new(), _poll: poll }
+        Media { now: None, error: None, art: HashMap::new(), _poll: poll }
     }
 
-    /// A player that never polls Spotify (for tests and previews).
+    /// A player that never polls media apps (for tests and previews).
     pub fn idle() -> Media {
-        Media { now: None, art: HashMap::new(), _poll: Task::ready(()) }
+        Media { now: None, error: None, art: HashMap::new(), _poll: Task::ready(()) }
     }
 
     /// The current track's cover, once fetched.
@@ -105,62 +134,153 @@ impl Media {
     }
 
     pub fn control(&mut self, control: Control, cx: &mut Context<Self>) {
-        if let Some(now) = &mut self.now
-            && let Control::PlayPause = control
-        {
-            now.playing = !now.playing;
-            cx.notify();
-        }
-        cx.background_executor()
-            .spawn(async move {
-                let verb = match control {
-                    Control::PlayPause => "playpause",
-                    Control::Next => "next track",
-                    Control::Previous => "previous track",
-                };
-                run(&format!("if application \"Spotify\" is running then tell application \"Spotify\" to {verb}"));
+        let Some(player) = self.now.as_ref().map(|n| n.player) else {
+            return;
+        };
+        let task = cx.background_executor().spawn(async move {
+            let verb = match control {
+                Control::PlayPause => "playpause",
+                Control::Next => "next track",
+                Control::Previous => "previous track",
+            };
+            let app = player.application();
+            run(&format!("if application \"{app}\" is running then tell application \"{app}\" to {verb}"))
+                .map_err(|error| player_error(player, &error))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let (now, poll_error) = cx.background_executor().spawn(async { now_playing() }).await;
+            this.update(cx, |media, cx| {
+                media.error = result.err().or(poll_error);
+                media.now = now;
+                media.fetch_art(cx);
+                cx.notify();
             })
-            .detach();
+            .ok();
+        })
+        .detach();
     }
 }
 
-const QUERY: &str = r#"
-if application "Spotify" is running then
-    tell application "Spotify"
-        set s to player state as string
-        if s is "stopped" then return ""
-        set t to current track
-        return s & tab & (name of t) & tab & (artist of t) & tab & (player position as string) & tab & ((duration of t) as string) & tab & (artwork url of t)
-    end tell
-end if
+fn query(player: Player) -> String {
+    let app = player.application();
+    let (duration, art) = if player == Player::Spotify {
+        ("duration of t", "artwork url of t")
+    } else {
+        ("(duration of t) * 1000", "\"\"")
+    };
+    format!(
+        r#"
+with timeout of 5 seconds
+    if application "{app}" is running then
+        tell application "{app}"
+            set s to player state as string
+            if s is "stopped" then return ""
+            set t to current track
+            set cover to ""
+            try
+                set cover to {art}
+            end try
+            return s & tab & (name of t) & tab & (artist of t) & tab & (player position as string) & tab & (({duration}) as string) & tab & cover
+        end tell
+    end if
+end timeout
 return ""
-"#;
-
-fn now_playing() -> Option<NowPlaying> {
-    parse(&run(QUERY)?)
+"#
+    )
 }
 
-fn run(script: &str) -> Option<String> {
-    if !cfg!(target_os = "macos") {
-        return None;
+fn player_error(player: Player, error: &str) -> String {
+    if error.contains("-1743") || error.contains("not authorized") {
+        format!("Allow Roughcut to control {} in System Settings → Privacy & Security → Automation.", player.name())
+    } else {
+        format!("{} connection failed. {}", player.name(), error.trim())
     }
-    let output = Command::new("osascript").arg("-e").arg(script).output().ok()?;
-    output.status.success().then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn choose_player(tracks: impl IntoIterator<Item = NowPlaying>) -> Option<NowPlaying> {
+    let mut selected = None;
+    for track in tracks {
+        if track.playing {
+            return Some(track);
+        }
+        if selected.is_none() {
+            selected = Some(track);
+        }
+    }
+    selected
+}
+
+fn now_playing() -> (Option<NowPlaying>, Option<String>) {
+    let mut tracks = Vec::new();
+    let mut error = None;
+    for player in [Player::Spotify, Player::Music, Player::ITunes] {
+        if !player.installed() {
+            continue;
+        }
+        match run(&query(player)) {
+            Ok(output) => {
+                if let Some(mut track) = parse(&output) {
+                    track.player = player;
+                    tracks.push(track);
+                }
+            }
+            Err(message) => {
+                if error.is_none() {
+                    error = Some(player_error(player, &message));
+                }
+            }
+        }
+    }
+    (choose_player(tracks), error)
+}
+
+fn run(script: &str) -> Result<String, String> {
+    if !cfg!(target_os = "macos") {
+        return Ok(String::new());
+    }
+    let mut child = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("The player did not respond in time.".into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let output = child.wait_with_output().map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 /// Parses `state \t name \t artist \t position-seconds \t duration-ms \t artwork-url`.
 fn parse(line: &str) -> Option<NowPlaying> {
     let mut parts = line.split('\t');
     let state = parts.next()?;
+    if !matches!(state, "playing" | "paused") {
+        return None;
+    }
     let title = parts.next()?.to_owned();
     let artist = parts.next()?.to_owned();
-    // AppleScript formats reals with the user's locale decimal separator.
-    let number = |s: Option<&str>| s.and_then(|s| s.trim().replace(',', ".").parse::<f32>().ok());
+    let number =
+        |s: Option<&str>| s.and_then(|s| s.trim().replace(',', ".").parse::<f32>().ok()).filter(|n| n.is_finite());
     let position = number(parts.next()).unwrap_or(0.);
     let duration_ms = number(parts.next()).unwrap_or(0.);
     let progress = if duration_ms > 0. { (position * 1000. / duration_ms).clamp(0., 1.) } else { 0. };
     let artwork_url = parts.next().map(str::trim).filter(|u| !u.is_empty() && *u != "missing value").map(String::from);
-    Some(NowPlaying { title, artist, playing: state == "playing", progress, artwork_url })
+    Some(NowPlaying { player: Player::Spotify, title, artist, playing: state == "playing", progress, artwork_url })
 }
 
 /// Only Spotify's image CDN, over HTTPS, with no credentials or custom port.
@@ -179,7 +299,7 @@ fn download_art(url: &str) -> Option<Image> {
         .https_only(true)
         .max_redirects(0)
         .timeout_global(Some(ART_TIMEOUT))
-        .user_agent("Quill")
+        .user_agent("Roughcut")
         .accept("image/jpeg, image/png")
         .build();
     let agent = ureq::Agent::new_with_config(config);
@@ -214,6 +334,33 @@ mod tests {
         assert!(!paused.playing);
         assert_eq!(paused.artwork_url, None);
         assert_eq!(parse(""), None);
+    }
+
+    #[test]
+    fn selects_playing_music_over_paused_spotify_and_uses_music_seconds() {
+        use super::{Player, choose_player, player_error, query};
+        let spotify = parse("paused\tOne\tArtist\t20\t200000\t").unwrap();
+        let mut music = parse("playing\tTwo\tArtist\t30\t120000\t").unwrap();
+        music.player = Player::Music;
+        assert_eq!(choose_player([spotify, music.clone()]), Some(music));
+        assert!(query(Player::Music).contains("(duration of t) * 1000"));
+        assert!(query(Player::ITunes).contains("application \"iTunes\""));
+        assert!(player_error(Player::Spotify, "Not authorized (-1743)").contains("Automation"));
+        assert_eq!(parse("stopped\tTrack\tArtist\t0\t1\t"), None);
+        assert_eq!(parse("playing\tTrack\tArtist\tNaN\tInfinity\t").unwrap().progress, 0.);
+    }
+
+    #[test]
+    #[ignore = "reads local media apps through macOS automation"]
+    fn reads_running_players() {
+        let (now, error) = super::now_playing();
+        assert!(error.is_none(), "{error:?}");
+        if let Some(track) = now {
+            assert!(track.progress.is_finite());
+            println!("{} status and track metadata received (playing: {}).", track.player.name(), track.playing);
+        } else {
+            println!("No running player has a current track.");
+        }
     }
 
     #[test]

@@ -2,6 +2,11 @@
 name = "quill"
 version = "0.1.0"
 edition = "2024"
+default-run = "roughcut"
+
+[[bin]]
+name = "roughcut"
+path = "src/main.rs"
 
 [features]
 # Offscreen screenshot tour for design review (see src/tour.rs).
@@ -32,3 +37,9 @@ required-features = ["screenshots"]
 
 [dev-dependencies]
 quill-spell = { path = "../quill-spell" }
+tempfile = "3.27.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.5"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSImage"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSData"] }

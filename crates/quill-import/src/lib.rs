@@ -1,7 +1,7 @@
 //! Converts documents from other apps into Quill documents. Everything runs
 //! locally; source files are only read, never changed.
 //!
-//! Supported: .docx (including Google Docs exported by Takeout), .odt, .md,
+//! Supported: .docx, .odt, .md,
 //! .txt, .rtf, .html, plus folders and .zip archives of any of these.
 
 mod builder;
@@ -32,7 +32,7 @@ pub enum Error {
 #[derive(Debug)]
 pub struct Imported {
     pub doc: Document,
-    /// Comments from the source, to become sticky notes.
+    /// Comments from the source, to become board text.
     pub notes: Vec<String>,
 }
 

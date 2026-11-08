@@ -1,4 +1,4 @@
-//! Word documents, including Google Docs exports from Takeout.
+//! Word documents, including exports from other word processors.
 
 use std::collections::HashMap;
 use std::io::{Cursor, Read};
@@ -208,7 +208,7 @@ pub(crate) mod tests {
     const W: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main""#;
 
     #[test]
-    fn google_docs_style_document() {
+    fn exported_document_with_styles_and_comments() {
         let body = format!(
             r#"<w:document {W}><w:body>
             <w:p><w:pPr><w:pStyle w:val="Title"/></w:pPr><w:r><w:t>Winter Orchard</w:t></w:r></w:p>

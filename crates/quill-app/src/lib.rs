@@ -1,13 +1,16 @@
-//! Quill, a local-first writing app. `main.rs` only calls [`run`]; the
+//! Roughcut, a local-first writing app. `main.rs` only calls [`run`]; the
 //! modules are public so integration tests can drive real views.
 
 pub mod anim;
 pub mod assets;
 pub mod board;
+mod board_input;
 pub mod demo;
 pub mod editor;
 pub mod home;
 pub mod import;
+#[cfg(target_os = "macos")]
+mod macos;
 pub mod media;
 pub mod page;
 pub mod storage;
@@ -37,7 +40,7 @@ enum Screen {
     Editor(Entity<EditorView>),
 }
 
-struct QuillApp {
+struct RoughcutApp {
     library: Rc<RefCell<Library>>,
     speller: Rc<RefCell<quill_spell::Speller>>,
     /// Bumped on every screen change so the new screen animates in.
@@ -47,7 +50,7 @@ struct QuillApp {
     _subscription: Subscription,
 }
 
-impl QuillApp {
+impl RoughcutApp {
     fn new(
         library: Rc<RefCell<Library>>,
         speller: Rc<RefCell<quill_spell::Speller>>,
@@ -55,9 +58,29 @@ impl QuillApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let media = cx.new(Media::new);
+        let media = cx.new(|cx| {
+            // Public screenshots must never include the user's listening activity.
+            #[cfg(feature = "screenshots")]
+            if std::env::var_os("ROUGHCUT_SCREENSHOTS").or_else(|| std::env::var_os("QUILL_SCREENSHOTS")).is_some() {
+                return Media::idle();
+            }
+            Media::new(cx)
+        });
+        let app = cx.weak_entity();
+        window.on_window_should_close(cx, move |_, cx| app.update(cx, |app, cx| app.flush(cx)).unwrap_or(true));
         let (screen, subscription) = Self::home(library.clone(), notice, window, cx);
-        QuillApp { library, speller, screen_gen: 0, media, screen, _subscription: subscription }
+        RoughcutApp { library, speller, screen_gen: 0, media, screen, _subscription: subscription }
+    }
+
+    fn flush(&mut self, cx: &mut Context<Self>) -> bool {
+        match &self.screen {
+            Screen::Editor(editor) => editor.update(cx, |editor, cx| {
+                let saved = editor.commit();
+                cx.notify();
+                saved
+            }),
+            _ => true,
+        }
     }
 
     fn home(
@@ -122,7 +145,7 @@ impl QuillApp {
         let doc = match self.library.borrow_mut().open_document(id) {
             Ok(doc) => doc,
             Err(err) => {
-                eprintln!("quill: opening document {id} failed: {err}");
+                eprintln!("roughcut: opening document {id} failed: {err}");
                 return;
             }
         };
@@ -132,13 +155,16 @@ impl QuillApp {
         self._subscription = cx.subscribe_in(&editor, window, |this, _, event, window, cx| match event {
             EditorEvent::Close => this.show_home(window, cx),
         });
-        self.screen = Screen::Editor(editor);
+        self.screen = Screen::Editor(editor.clone());
+        window.on_next_frame(move |window, cx| {
+            editor.update(cx, |editor, cx| editor.focus_document(window, cx));
+        });
         self.screen_gen += 1;
         cx.notify();
     }
 }
 
-impl Render for QuillApp {
+impl Render for RoughcutApp {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let view = match &self.screen {
             Screen::Home(home) => home.clone().into_any_element(),
@@ -155,9 +181,9 @@ impl Render for QuillApp {
 }
 
 fn welcome(library: &mut Library) {
-    let mut doc = Document::new("Welcome to Quill");
+    let mut doc = Document::new("Welcome to Roughcut");
     doc.blocks = vec![
-        Block::new(BlockKind::Heading(1), "Welcome to Quill"),
+        Block::new(BlockKind::Heading(1), "Welcome to Roughcut"),
         Block::new(
             BlockKind::Paragraph,
             "Everything you write stays on this computer. Every change is kept forever, so undo can always take you back.",
@@ -165,28 +191,28 @@ fn welcome(library: &mut Library) {
         Block::new(BlockKind::Heading(2), "Try it"),
         Block::new(BlockKind::Bullet, "Select some text and press ⌘B, ⌘I or ⌘U."),
         Block::new(BlockKind::Bullet, "Press ⌘Z as many times as you like, then ⌘⇧Z to come back."),
-        Block::new(BlockKind::Bullet, "Click outside the page to use the board: sticky notes, pens and shapes."),
+        Block::new(BlockKind::Bullet, "Click outside the page to use the board: text, pens and filled shapes."),
         Block::new(BlockKind::Bullet, "Press ⌘⇧F for focus mode, and Esc to return to your library."),
     ];
     if let Err(err) = library.create(&doc, None) {
-        eprintln!("quill: creating the welcome document failed: {err}");
+        eprintln!("roughcut: creating the welcome document failed: {err}");
     }
 }
 
-/// Starts Quill: opens (or recovers) the library and shows the main window.
+/// Starts Roughcut: opens (or recovers) the library and shows the main window.
 pub fn run() {
     let locations = Rc::new(Locations::resolve());
     let (mut library, recovery) = match locations.open() {
         Ok(opened) => opened,
         Err(err) => {
-            eprintln!("quill: could not open the library at {}: {err}", locations.library.display());
+            eprintln!("roughcut: could not open the library at {}: {err}", locations.library.display());
             std::process::exit(1);
         }
     };
     if library.list(None).map(|d| d.is_empty()).unwrap_or(false) {
-        if std::env::var_os("QUILL_DEMO").is_some() {
+        if std::env::var_os("ROUGHCUT_DEMO").or_else(|| std::env::var_os("QUILL_DEMO")).is_some() {
             if let Err(err) = demo::seed(&mut library) {
-                eprintln!("quill: seeding demo content failed: {err}");
+                eprintln!("roughcut: seeding demo content failed: {err}");
             }
         } else {
             welcome(&mut library);
@@ -203,10 +229,11 @@ pub fn run() {
 
     gpui_kit::application().with_assets(assets::Assets).run(move |cx| {
         gpui_kit::init(cx);
+        #[cfg(target_os = "macos")]
+        macos::set_application_icon();
         Theme::change(ThemeMode::Dark, None, cx);
         editor::bind_keys(cx);
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
-        cx.on_action(|_: &Quit, cx| cx.quit());
 
         cx.spawn({
             let (library, locations) = (library.clone(), locations.clone());
@@ -216,26 +243,32 @@ pub fn run() {
             }
         })
         .detach();
-        cx.on_app_quit({
-            let (library, locations) = (library.clone(), locations.clone());
-            move |_| {
-                locations.back_up(&library.borrow());
-                async {}
-            }
-        })
-        .detach();
-
+        let backup_library = library.clone();
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(1440.), px(900.)), cx))),
-            titlebar: Some(TitlebarOptions { title: Some("Quill".into()), ..Default::default() }),
+            titlebar: Some(TitlebarOptions { title: Some("Roughcut".into()), ..Default::default() }),
             ..Default::default()
         };
         let window = gpui_kit::open_window(options, cx, move |window, cx| {
-            cx.new(|cx| QuillApp::new(library, speller, notice, window, cx))
+            cx.new(|cx| RoughcutApp::new(library, speller, notice, window, cx))
         })
         .expect("failed to open window");
+        let app = window.1.downgrade();
+        cx.on_action(move |_: &Quit, cx| {
+            if app.update(cx, |app, cx| app.flush(cx)).unwrap_or(true) {
+                cx.quit();
+            }
+        });
+        let app = window.1.downgrade();
+        cx.on_app_quit(move |cx| {
+            // Flush before taking the final backup, regardless of observer order.
+            let _ = app.update(cx, |app, cx| app.flush(cx));
+            locations.back_up(&backup_library.borrow());
+            async {}
+        })
+        .detach();
         #[cfg(feature = "screenshots")]
-        if let Some(dir) = std::env::var_os("QUILL_SCREENSHOTS") {
+        if let Some(dir) = std::env::var_os("ROUGHCUT_SCREENSHOTS").or_else(|| std::env::var_os("QUILL_SCREENSHOTS")) {
             tour::run(window.0, window.1, dir.into(), cx);
         }
         #[cfg(not(feature = "screenshots"))]

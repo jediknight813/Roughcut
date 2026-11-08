@@ -6,15 +6,16 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use crate::board_input::{BoardInput, BoardInputEvent};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
+use quill_doc::Marks;
 use quill_store::{BoardItem, ItemId, ItemKind};
 
 use crate::anim;
 use crate::assets::icon;
-use crate::editor::{EditorView, Mode, floating_shadow};
+use crate::editor::{EditorView, Mode};
 use crate::theme;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -22,7 +23,6 @@ pub enum Tool {
     Select,
     Pen,
     Highlighter,
-    Sticky,
     Shape,
     Text,
     Image,
@@ -30,15 +30,14 @@ pub enum Tool {
 }
 
 impl Tool {
-    pub const ALL: [Tool; 8] =
-        [Tool::Select, Tool::Pen, Tool::Highlighter, Tool::Sticky, Tool::Shape, Tool::Text, Tool::Image, Tool::Eraser];
+    pub const ALL: [Tool; 7] =
+        [Tool::Select, Tool::Pen, Tool::Highlighter, Tool::Shape, Tool::Text, Tool::Image, Tool::Eraser];
 
     fn label(self) -> &'static str {
         match self {
             Tool::Select => "Select",
             Tool::Pen => "Pen",
             Tool::Highlighter => "Highlighter",
-            Tool::Sticky => "Sticky note",
             Tool::Shape => "Shape",
             Tool::Text => "Text",
             Tool::Image => "Image",
@@ -51,7 +50,6 @@ impl Tool {
             Tool::Select => "mouse-pointer-2",
             Tool::Pen => "pen-line",
             Tool::Highlighter => "highlighter",
-            Tool::Sticky => "sticky-note",
             Tool::Shape => "square",
             Tool::Text => "type",
             Tool::Image => "image",
@@ -60,36 +58,39 @@ impl Tool {
     }
 }
 
-pub const NOTE_COLORS: [u32; 4] = [0xfde68a, 0xfbcfe8, 0xbfdbfe, 0xbbf7d0];
-const STICKY_SIZE: (f32, f32) = (200., 150.);
+pub const BOARD_COLORS: [u32; 4] = [0xfde68a, 0xfbcfe8, 0xbfdbfe, 0xbbf7d0];
 const PEN_WIDTH: f32 = 2.5;
 const HIGHLIGHTER_WIDTH: f32 = 14.;
 const HIGHLIGHTER_COLOR: u32 = 0xfacc15;
-const STICKY_INK: u32 = 0x2b2618;
 
 pub enum Gesture {
     Drawing { points: Vec<Point<Pixels>>, highlighter: bool },
     Shaping { start: Point<Pixels>, end: Point<Pixels> },
-    Dragging { id: ItemId, grab: Point<Pixels>, start: (f32, f32) },
+    Dragging { id: ItemId, grab: Point<Pixels>, start: (f32, f32), edit_on_click: bool },
+    Resizing { id: ItemId, grab: Point<Pixels>, original: (f32, f32, f32, f32), edges: (i8, i8) },
 }
 
 pub struct Editing {
     pub id: ItemId,
-    pub state: Entity<TextareaState>,
+    pub state: Entity<BoardInput>,
     _subscription: Subscription,
 }
 
 impl EditorView {
+    pub fn editing_text_input(&self) -> Option<Entity<BoardInput>> {
+        self.editing.as_ref().map(|e| e.state.clone())
+    }
+
     pub(crate) fn reload_board(&mut self) {
         match self.library.borrow().board(self.id) {
             Ok(items) => self.board = items,
-            Err(err) => eprintln!("quill: loading the board failed: {err}"),
+            Err(err) => eprintln!("roughcut: loading the board failed: {err}"),
         }
     }
 
     /// Window position -> board coordinates (unscaled page pixels).
     fn to_board(&self, p: Point<Pixels>) -> Point<Pixels> {
-        let z = self.zoom.value().max(0.01);
+        let z = self.page_scale().max(0.01);
         let d = p - self.board_origin;
         point(d.x / z, d.y / z)
     }
@@ -97,7 +98,9 @@ impl EditorView {
     pub(crate) fn board_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.mode == Mode::Page {
             self.set_mode(Mode::Board, window, cx);
-            return;
+            if event.click_count < 2 {
+                return;
+            }
         }
         if self.mode != Mode::Board {
             return;
@@ -109,28 +112,46 @@ impl EditorView {
         self.stop_editing_item(cx);
         self.selected_item = None;
         let p = self.to_board(event.position);
+        if event.click_count >= 2 {
+            self.gesture = None;
+            self.create_board_text(p, window, cx);
+            cx.notify();
+            return;
+        }
         match self.tool {
             Tool::Pen | Tool::Highlighter => {
                 self.gesture = Some(Gesture::Drawing { points: vec![p], highlighter: self.tool == Tool::Highlighter })
             }
             Tool::Shape => self.gesture = Some(Gesture::Shaping { start: p, end: p }),
-            Tool::Sticky => {
-                let (w, h) = STICKY_SIZE;
-                let kind = ItemKind::Sticky { text: String::new(), color: self.note_color };
-                if let Some(id) = self.add_item(f32::from(p.x) - w / 2., f32::from(p.y) - 20., w, h, kind) {
-                    self.tool = Tool::Select;
-                    self.edit_item(id, window, cx);
-                }
-            }
-            Tool::Text => {
-                let kind = ItemKind::Text { text: String::new() };
-                if let Some(id) = self.add_item(f32::from(p.x), f32::from(p.y) - 12., 260., 60., kind) {
-                    self.tool = Tool::Select;
-                    self.edit_item(id, window, cx);
-                }
-            }
+            Tool::Text => self.create_board_text(p, window, cx),
             Tool::Image => self.insert_image(p, cx),
             Tool::Select | Tool::Eraser => {}
+        }
+        cx.notify();
+    }
+
+    fn create_board_text(&mut self, at: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let kind = ItemKind::Text { text: String::new(), style: Default::default() };
+        if let Some(id) = self.add_item(f32::from(at.x), f32::from(at.y) - 12., 260., 60., kind) {
+            self.tool = Tool::Select;
+            self.edit_item(id, window, cx);
+        }
+    }
+
+    fn choose_board_color(&mut self, color: u32, cx: &mut Context<Self>) {
+        self.board_color = color;
+        if let Some(mut item) = self.board.iter().find(|i| Some(i.id) == self.selected_item).cloned()
+            && let ItemKind::Shape { color: fill, .. } = &mut item.kind
+        {
+            *fill = color;
+            match self.library.borrow_mut().update_item(&item) {
+                Ok(()) => {
+                    if let Some(current) = self.board.iter_mut().find(|i| i.id == item.id) {
+                        *current = item;
+                    }
+                }
+                Err(err) => eprintln!("roughcut: changing the shape color failed: {err}"),
+            }
         }
         cx.notify();
     }
@@ -148,7 +169,7 @@ impl EditorView {
                 *end = p;
                 cx.notify();
             }
-            Some(Gesture::Dragging { id, grab, start }) => {
+            Some(Gesture::Dragging { id, grab, start, .. }) => {
                 let delta = p - *grab;
                 let (id, start) = (*id, *start);
                 if let Some(item) = self.board.iter_mut().find(|i| i.id == id) {
@@ -157,11 +178,33 @@ impl EditorView {
                     cx.notify();
                 }
             }
+            Some(Gesture::Resizing { id, grab, original: (x, y, w, h), edges: (ex, ey) }) => {
+                let delta = p - *grab;
+                if let Some(item) = self.board.iter_mut().find(|i| i.id == *id) {
+                    let dx = f32::from(delta.x);
+                    let dy = f32::from(delta.y);
+                    if *ex < 0 {
+                        item.w = (*w - dx).max(48.);
+                        item.x = *x + *w - item.w;
+                    }
+                    if *ex > 0 {
+                        item.w = (*w + dx).max(48.);
+                    }
+                    if *ey < 0 {
+                        item.h = (*h - dy).max(40.);
+                        item.y = *y + *h - item.h;
+                    }
+                    if *ey > 0 {
+                        item.h = (*h + dy).max(40.);
+                    }
+                    cx.notify();
+                }
+            }
             None => {}
         }
     }
 
-    pub(crate) fn board_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn board_mouse_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         match self.gesture.take() {
             Some(Gesture::Drawing { points, highlighter }) if points.len() > 1 => {
                 let (min, max) = bounds_of(&points);
@@ -186,12 +229,29 @@ impl EditorView {
                 let (min, max) = bounds_of(&[start, end]);
                 let size = max - min;
                 if size.x > px(8.) && size.y > px(8.) {
-                    let kind = ItemKind::Shape { ellipse: false, color: self.pen_color() };
-                    self.add_item(f32::from(min.x), f32::from(min.y), f32::from(size.x), f32::from(size.y), kind);
+                    let kind = ItemKind::Shape {
+                        ellipse: false,
+                        color: self.board_color,
+                        text: String::new(),
+                        style: quill_store::BoardTextStyle::shape(),
+                    };
+                    self.selected_item =
+                        self.add_item(f32::from(min.x), f32::from(min.y), f32::from(size.x), f32::from(size.y), kind);
+                    self.tool = Tool::Select;
                 }
             }
-            Some(Gesture::Dragging { id, .. }) => {
+            Some(Gesture::Dragging { id, grab, edit_on_click, .. }) => {
                 if let Some(item) = self.board.iter().find(|i| i.id == id).cloned() {
+                    self.save_item(&item);
+                }
+                if edit_on_click && (self.to_board(event.position) - grab).magnitude() < 3. {
+                    self.edit_item(id, window, cx);
+                }
+            }
+            Some(Gesture::Resizing { id, .. }) => {
+                if let Some(item) = self.board.iter_mut().find(|i| i.id == id) {
+                    grow_text_item(item, window);
+                    let item = item.clone();
                     self.save_item(&item);
                 }
             }
@@ -201,6 +261,16 @@ impl EditorView {
     }
 
     fn item_mouse_down(&mut self, id: ItemId, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mode == Mode::Page {
+            self.set_mode(Mode::Board, window, cx);
+            self.tool = Tool::Select;
+            if self.board.iter().any(|i| i.id == id && matches!(i.kind, ItemKind::Shape { .. })) {
+                cx.stop_propagation();
+                window.prevent_default();
+                self.edit_item(id, window, cx);
+                return;
+            }
+        }
         if self.mode != Mode::Board {
             return;
         }
@@ -212,7 +282,7 @@ impl EditorView {
             Tool::Pen | Tool::Highlighter => {
                 // Let the board start a stroke over the item.
             }
-            Tool::Select | Tool::Sticky | Tool::Text | Tool::Shape | Tool::Image => {
+            Tool::Select | Tool::Text | Tool::Shape | Tool::Image => {
                 cx.stop_propagation();
                 if self.editing.as_ref().is_some_and(|e| e.id == id) {
                     // Clicks inside the note being edited belong to its text box.
@@ -220,11 +290,8 @@ impl EditorView {
                 }
                 window.prevent_default();
                 window.focus(&self.focus_handle, cx);
-                let editable = self
-                    .board
-                    .iter()
-                    .find(|i| i.id == id)
-                    .is_some_and(|i| matches!(i.kind, ItemKind::Sticky { .. } | ItemKind::Text { .. }));
+                let editable =
+                    self.board.iter().find(|i| i.id == id).is_some_and(|i| matches!(i.kind, ItemKind::Text { .. }));
                 if event.click_count >= 2 && editable {
                     self.edit_item(id, window, cx);
                     return;
@@ -236,8 +303,15 @@ impl EditorView {
                 self.selected_item = Some(id);
                 self.raise(id);
                 if let Some(item) = self.board.iter().find(|i| i.id == id) {
-                    self.gesture =
-                        Some(Gesture::Dragging { id, grab: self.to_board(event.position), start: (item.x, item.y) });
+                    if let ItemKind::Shape { color, .. } = &item.kind {
+                        self.board_color = *color;
+                    }
+                    self.gesture = Some(Gesture::Dragging {
+                        id,
+                        grab: self.to_board(event.position),
+                        start: (item.x, item.y),
+                        edit_on_click: matches!(item.kind, ItemKind::Shape { .. }),
+                    });
                 }
                 cx.notify();
             }
@@ -263,7 +337,7 @@ impl EditorView {
     pub(crate) fn undo_board(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(id) = self.removed_items.pop() else { return false };
         if let Err(err) = self.library.borrow_mut().restore_item(id) {
-            eprintln!("quill: restoring an item failed: {err}");
+            eprintln!("roughcut: restoring an item failed: {err}");
         }
         self.reload_board();
         cx.notify();
@@ -272,7 +346,7 @@ impl EditorView {
 
     fn remove_item(&mut self, id: ItemId, cx: &mut Context<Self>) {
         if let Err(err) = self.library.borrow_mut().remove_item(id) {
-            eprintln!("quill: removing an item failed: {err}");
+            eprintln!("roughcut: removing an item failed: {err}");
             return;
         }
         self.removed_items.push(id);
@@ -300,7 +374,7 @@ impl EditorView {
                 Some(id)
             }
             Err(err) => {
-                eprintln!("quill: adding to the board failed: {err}");
+                eprintln!("roughcut: adding to the board failed: {err}");
                 None
             }
         }
@@ -308,14 +382,14 @@ impl EditorView {
 
     fn save_item(&self, item: &BoardItem) {
         if let Err(err) = self.library.borrow_mut().update_item(item) {
-            eprintln!("quill: saving a board item failed: {err}");
+            eprintln!("roughcut: saving a board item failed: {err}");
         }
     }
 
-    /// Pen strokes use a stronger version of the chosen note colour so they
+    /// Pen strokes use a stronger version of the chosen board colour so they
     /// read on the dark board.
     fn pen_color(&self) -> u32 {
-        match self.note_color {
+        match self.board_color {
             0xfde68a => 0xfacc15,
             0xfbcfe8 => 0xf472b6,
             0xbfdbfe => 0x7b9af0,
@@ -324,32 +398,86 @@ impl EditorView {
     }
 
     pub(crate) fn edit_item(&mut self, id: ItemId, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(text) = self.board.iter().find(|i| i.id == id).and_then(|i| match &i.kind {
-            ItemKind::Sticky { text, .. } | ItemKind::Text { text } => Some(text.clone()),
-            _ => None,
-        }) else {
+        let Some((text, style)) =
+            self.board.iter().find(|i| i.id == id).and_then(|i| i.kind.text()).map(|(t, s)| (t.to_owned(), s.clone()))
+        else {
             return;
         };
         self.stop_editing_item(cx);
-        let state = cx.new(|cx| TextareaState::new(window, cx).default_value(text));
-        let subscription = cx.subscribe_in(&state, window, move |this, state, event, _, cx| match event {
-            InputEvent::Change => {
+        let state = cx.new(|cx| BoardInput::new(text, style, window, cx));
+        let subscription = cx.subscribe_in(&state, window, move |this, state, event, window, cx| match event {
+            BoardInputEvent::Change => {
                 let value = state.read(cx).value().to_string();
                 if let Some(item) = this.board.iter_mut().find(|i| i.id == id) {
-                    match &mut item.kind {
-                        ItemKind::Sticky { text, .. } | ItemKind::Text { text } => *text = value,
-                        _ => {}
+                    if let Some((text, _)) = item.kind.text_mut() {
+                        *text = value;
                     }
+                    grow_text_item(item, window);
                     let item = item.clone();
                     this.save_item(&item);
+                    this.sync_board_edit_style(cx);
+                    cx.notify();
                 }
             }
-            InputEvent::Blur => this.stop_editing_item(cx),
-            _ => {}
+            BoardInputEvent::Blur => this.stop_editing_item(cx),
         });
         state.update(cx, |s, cx| s.focus(window, cx));
         self.editing = Some(Editing { id, state, _subscription: subscription });
         self.selected_item = Some(id);
+        self.sync_board_edit_style(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn sync_board_edit_style(&mut self, cx: &mut Context<Self>) {
+        let Some(editing) = &self.editing else {
+            return;
+        };
+        let Some((_, style)) = self.board.iter().find(|i| i.id == editing.id).and_then(|i| i.kind.text()) else {
+            return;
+        };
+        editing.state.update(cx, |s, cx| s.set_style(style.clone(), cx));
+    }
+
+    pub(crate) fn update_board_style(
+        &mut self,
+        change: impl FnOnce(&mut quill_store::BoardTextStyle),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(item) = self.board.iter_mut().find(|i| Some(i.id) == self.selected_item) else {
+            return;
+        };
+        let Some((_, style)) = item.kind.text_mut() else {
+            return;
+        };
+        change(style);
+        grow_text_item(item, window);
+        let item = item.clone();
+        self.save_item(&item);
+        self.sync_board_edit_style(cx);
+        cx.notify();
+    }
+
+    fn resize_item(
+        &mut self,
+        id: ItemId,
+        edges: (i8, i8),
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        window.prevent_default();
+        self.stop_editing_item(cx);
+        window.focus(&self.focus_handle, cx);
+        if let Some(item) = self.board.iter().find(|i| i.id == id) {
+            self.gesture = Some(Gesture::Resizing {
+                id,
+                edges,
+                grab: self.to_board(event.position),
+                original: (item.x, item.y, item.w, item.h),
+            });
+        }
         cx.notify();
     }
 
@@ -357,7 +485,7 @@ impl EditorView {
         if let Some(editing) = self.editing.take() {
             // An empty new note or text box is dropped rather than left behind.
             let empty = self.board.iter().find(|i| i.id == editing.id).is_some_and(|i| match &i.kind {
-                ItemKind::Sticky { text, .. } | ItemKind::Text { text } => text.trim().is_empty(),
+                ItemKind::Text { text, .. } => text.trim().is_empty(),
                 _ => false,
             });
             if empty {
@@ -400,7 +528,7 @@ impl EditorView {
             let asset = match self.library.borrow_mut().add_asset(mime, &bytes) {
                 Ok(asset) => asset,
                 Err(err) => {
-                    eprintln!("quill: storing the image failed: {err}");
+                    eprintln!("roughcut: storing the image failed: {err}");
                     return;
                 }
             };
@@ -423,9 +551,14 @@ impl EditorView {
 
     /// The board layer: a zero-size anchor at the page's top centre with
     /// every item absolutely positioned (and scaled) around it.
-    pub(crate) fn render_board(&mut self, opacity: f32, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_board(
+        &mut self,
+        opacity: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let interactive = self.mode == Mode::Board;
-        let z = self.zoom.value();
+        let z = self.page_scale();
         let entity = cx.entity();
         let items: Vec<BoardItem> = self.board.clone();
         let mut children: Vec<AnyElement> = Vec::new();
@@ -440,7 +573,7 @@ impl EditorView {
                 .top(px(item.y * z))
                 .w(px(item.w * z))
                 .h(px(item.h * z))
-                .when(interactive, |d| {
+                .when(self.mode != Mode::Focus, |d| {
                     d.cursor(if self.tool == Tool::Eraser {
                         CursorStyle::OperationNotAllowed
                     } else {
@@ -452,63 +585,49 @@ impl EditorView {
                     )
                 });
             let element = match &item.kind {
-                ItemKind::Sticky { text, color } => base
-                    .rounded(px(3.))
-                    .bg(rgb(*color))
-                    .shadow(sticky_shadow(selected))
-                    .when(selected, |d| d.border_2().border_color(theme::accent()))
-                    .overflow_hidden()
-                    .child(div().h(px(14. * z)).bg(rgba(0x0000000d)))
+                ItemKind::Text { .. } | ItemKind::Shape { .. } => {
+                    let (text, style) = item.kind.text().unwrap();
+                    let shape = matches!(item.kind, ItemKind::Shape { .. });
+                    let padding = if shape { 12. } else { 0. };
+                    let text_height = text_height(text, style, (item.w - padding * 2.).max(16.), window);
+                    let top = if shape { ((item.h - text_height) / 2.).max(padding) } else { 0. };
+                    let size = style.typography.size.unwrap_or(16) as f32;
+                    let color = style.typography.color.map(rgb).unwrap_or_else(theme::text_soft);
+                    base.when_some(
+                        match item.kind {
+                            ItemKind::Shape { color, .. } => Some(color),
+                            _ => None,
+                        },
+                        |d, color| d.bg(rgb(color)),
+                    )
+                    .when(shape, |d| d.rounded(px(8. * z)))
+                    .when(shape && selected, |d| d.shadow(item_shadow(true)))
                     .child(
                         div()
-                            .px(px(14. * z))
-                            .pt(px(6. * z))
-                            .text_color(rgb(STICKY_INK))
-                            .font_family(theme::NOTE_FONT)
-                            .text_size(px(19. * z))
-                            .line_height(px(25. * z))
+                            .absolute()
+                            .left(px(padding * z))
+                            .top(px(top * z))
+                            .w(px((item.w - padding * 2.).max(16.) * z))
+                            .h(px((text_height + 2.) * z))
+                            .font_family(crate::editor::formatting::font_family(style.typography.typeface))
+                            .text_size(px(size * z))
+                            .line_height(px(size * 1.5 * z))
+                            .text_color(color)
+                            .text_align(crate::editor::formatting::alignment(style.typography.alignment))
+                            .when(style.marks.contains(Marks::BOLD), |d| d.font_weight(FontWeight::BOLD))
+                            .when(style.marks.contains(Marks::ITALIC), |d| d.italic())
                             .child(match editing {
-                                Some(state) => Textarea::new(&state)
-                                    .appearance(false)
-                                    .p_0()
-                                    .h(px((item.h - 30.) * z))
-                                    .font_family(theme::NOTE_FONT)
-                                    .text_size(px(19. * z))
-                                    .line_height(px(25. * z))
-                                    .text_color(rgb(STICKY_INK))
+                                Some(state) => {
+                                    state.update(cx, |s, _| s.set_scale(z));
+                                    state.into_any_element()
+                                }
+                                None => StyledText::new(text.to_owned())
+                                    .with_highlights([(0..text.len(), text_highlight(style))])
                                     .into_any_element(),
-                                None => div().child(text.clone()).into_any_element(),
                             }),
                     )
-                    .into_any_element(),
-                ItemKind::Text { text } => base
-                    .p(px(4. * z))
-                    .rounded(px(6.))
-                    .when(selected, |d| d.border_1().border_color(theme::accent()))
-                    .text_color(theme::text_soft())
-                    .font_family(theme::PAGE_FONT)
-                    .italic()
-                    .text_size(px(16. * z))
-                    .line_height(px(24. * z))
-                    .child(match editing {
-                        Some(state) => Textarea::new(&state)
-                            .appearance(false)
-                            .p_0()
-                            .h_full()
-                            .font_family(theme::PAGE_FONT)
-                            .text_size(px(16. * z))
-                            .line_height(px(24. * z))
-                            .into_any_element(),
-                        None => div().child(text.clone()).into_any_element(),
-                    })
-                    .into_any_element(),
-                ItemKind::Shape { ellipse, color } => base
-                    .border_2()
-                    .border_color(rgb(*color))
-                    .when(*ellipse, |d| d.rounded_full())
-                    .when(!*ellipse, |d| d.rounded(px(8. * z)))
-                    .when(selected, |d| d.bg(rgba(0x7b9af01a)))
-                    .into_any_element(),
+                    .into_any_element()
+                }
                 ItemKind::Stroke { points, color, width } => {
                     let (points, color, width) = (points.clone(), *color, *width);
                     base.when(selected, |d| d.border_1().border_color(rgba(0x7b9af080)).rounded(px(4.)))
@@ -527,13 +646,63 @@ impl EditorView {
                     Some(image) => base
                         .rounded(px(8.))
                         .overflow_hidden()
-                        .shadow(sticky_shadow(selected))
+                        .shadow(item_shadow(selected))
                         .when(selected, |d| d.border_2().border_color(theme::accent()))
                         .child(img(image).size_full())
                         .into_any_element(),
                     None => base.bg(theme::raised()).rounded(px(8.)).into_any_element(),
                 },
             };
+            let resizable = selected
+                && matches!(item.kind, ItemKind::Text { .. } | ItemKind::Shape { .. } | ItemKind::Image { .. });
+            let mut handles = Vec::new();
+            if resizable {
+                for (index, (ex, ey)) in
+                    [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)].into_iter().enumerate()
+                {
+                    let edge = (ex, ey);
+                    let (left, top, width, height) = if ex == 0 {
+                        (item.x * z + 6., (item.y + if ey < 0 { 0. } else { item.h }) * z - 4., item.w * z - 12., 8.)
+                    } else if ey == 0 {
+                        ((item.x + if ex < 0 { 0. } else { item.w }) * z - 4., item.y * z + 6., 8., item.h * z - 12.)
+                    } else {
+                        (
+                            (item.x + if ex < 0 { 0. } else { item.w }) * z - 4.,
+                            (item.y + if ey < 0 { 0. } else { item.h }) * z - 4.,
+                            8.,
+                            8.,
+                        )
+                    };
+                    handles.push(
+                        div()
+                            .id(("resize", id as usize * 8 + index))
+                            .absolute()
+                            .left(px(left))
+                            .top(px(top))
+                            .w(px(width.max(8.)))
+                            .h(px(height.max(8.)))
+                            .cursor(if ex == 0 {
+                                CursorStyle::ResizeUpDown
+                            } else if ey == 0 {
+                                CursorStyle::ResizeLeftRight
+                            } else {
+                                if ex == ey {
+                                    CursorStyle::ResizeUpLeftDownRight
+                                } else {
+                                    CursorStyle::ResizeUpRightDownLeft
+                                }
+                            })
+                            .when(ex != 0 && ey != 0, |d| d.bg(theme::accent()).rounded(px(2.)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, event, window, cx| {
+                                    this.resize_item(id, edge, event, window, cx)
+                                }),
+                            )
+                            .into_any_element(),
+                    );
+                }
+            }
             // New items pop in; existing ones are already settled.
             children.push(
                 div()
@@ -544,6 +713,7 @@ impl EditorView {
                     })
                     .into_any_element(),
             );
+            children.extend(handles);
         }
 
         // The stroke or shape being drawn right now.
@@ -572,7 +742,8 @@ impl EditorView {
                         .w((max.x - min.x) * z)
                         .h((max.y - min.y) * z)
                         .border_2()
-                        .border_color(rgb(self.pen_color()))
+                        .bg(rgb(self.board_color))
+                        .border_color(theme::accent())
                         .rounded(px(8. * z))
                         .into_any_element(),
                 );
@@ -589,7 +760,7 @@ impl EditorView {
             .child(
                 canvas(
                     move |bounds, _, cx| {
-                        entity.update(cx, |this, _| this.board_origin = bounds.origin);
+                        entity.update(cx, |this, cx| this.record_board_origin(bounds.origin, cx));
                     },
                     |_, _, _, _| {},
                 )
@@ -598,26 +769,33 @@ impl EditorView {
             .children(children)
     }
 
-    /// The floating board toolbar. `presence` (0–1) fades and shrinks it a
-    /// little while writing so it stays out of the way.
-    pub(crate) fn tool_bar(&self, presence: f32, cx: &mut Context<Self>) -> impl IntoElement {
+    /// A fixed tool rail beside the canvas, shared by Page and Board modes.
+    pub(crate) fn tool_bar(&self, cx: &mut Context<Self>) -> AnyElement {
         let board = self.mode == Mode::Board;
+        let divider = || div().flex_none().w(px(32.)).h(px(1.)).my(px(8.)).bg(theme::border());
         div()
+            .id("board-tools")
+            .block_mouse_except_scroll()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .w(px(76.))
+            .h_full()
+            .min_h_0()
+            .flex_none()
+            .overflow_y_scroll()
             .flex()
+            .flex_col()
             .items_center()
             .gap(px(2.))
-            .p(px(5.))
-            .rounded(px(14.))
-            .bg(rgba(0x1d2027f2))
-            .border_1()
+            .p(px(10.))
+            .bg(theme::surface())
+            .border_r_1()
             .border_color(theme::border())
-            .shadow(floating_shadow())
-            .opacity(presence)
             .children(Tool::ALL.into_iter().map(|tool| {
                 let active = board && self.tool == tool;
                 div()
                     .id(tool.label())
                     .size(px(38.))
+                    .flex_none()
                     .flex()
                     .items_center()
                     .justify_center()
@@ -636,30 +814,32 @@ impl EditorView {
                         this.set_mode(Mode::Board, window, cx);
                     }))
             }))
-            .child(div().w(px(1.)).h(px(24.)).mx(px(6.)).bg(theme::border()))
-            .children(NOTE_COLORS.into_iter().map(|color| {
-                let active = self.note_color == color;
-                div()
-                    .id(("color", color as u64))
-                    .size(px(26.))
-                    .mx(px(1.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_full()
-                    .cursor_pointer()
-                    .when(active, |d| d.border_2().border_color(theme::text_soft()))
-                    .child(div().size(px(18.)).rounded_full().bg(rgb(color)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.note_color = color;
-                        cx.notify();
-                    }))
-            }))
-            .child(div().w(px(1.)).h(px(24.)).mx(px(6.)).bg(theme::border()))
+            .child(divider())
+            .child(div().w(px(54.)).flex_none().flex().flex_wrap().gap(px(2.)).children(BOARD_COLORS.into_iter().map(
+                |color| {
+                    let active = self.board_color == color;
+                    div()
+                        .id(("color", color as u64))
+                        .size(px(26.))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .cursor_pointer()
+                        .when(active, |d| d.border_2().border_color(theme::text_soft()))
+                        .child(div().size(px(18.)).rounded_full().bg(rgb(color)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.choose_board_color(color, cx);
+                        }))
+                },
+            )))
+            .child(divider())
             .child(
                 div()
-                    .id("zoom-out")
+                    .id("zoom-in")
                     .size(px(30.))
+                    .flex_none()
                     .flex()
                     .items_center()
                     .justify_center()
@@ -668,15 +848,16 @@ impl EditorView {
                     .text_size(px(17.))
                     .text_color(theme::text_soft())
                     .hover(|s| s.bg(theme::raised()))
-                    .child("−")
-                    .tooltip(|window, cx| Tooltip::new("Zoom out (⌘−)").build(window, cx))
-                    .on_click(cx.listener(|this, _, _, cx| this.zoom_step(false, cx))),
+                    .child("+")
+                    .tooltip(|window, cx| Tooltip::new("Zoom in (⌘=)").build(window, cx))
+                    .on_click(cx.listener(|this, _, _, cx| this.zoom_step(true, cx))),
             )
             .child(
                 div()
                     .id("zoom-reset")
                     .w(px(46.))
                     .h(px(30.))
+                    .flex_none()
                     .flex()
                     .items_center()
                     .justify_center()
@@ -691,8 +872,9 @@ impl EditorView {
             )
             .child(
                 div()
-                    .id("zoom-in")
+                    .id("zoom-out")
                     .size(px(30.))
+                    .flex_none()
                     .flex()
                     .items_center()
                     .justify_center()
@@ -701,10 +883,11 @@ impl EditorView {
                     .text_size(px(17.))
                     .text_color(theme::text_soft())
                     .hover(|s| s.bg(theme::raised()))
-                    .child("+")
-                    .tooltip(|window, cx| Tooltip::new("Zoom in (⌘=)").build(window, cx))
-                    .on_click(cx.listener(|this, _, _, cx| this.zoom_step(true, cx))),
+                    .child("−")
+                    .tooltip(|window, cx| Tooltip::new("Zoom out (⌘−)").build(window, cx))
+                    .on_click(cx.listener(|this, _, _, cx| this.zoom_step(false, cx))),
             )
+            .into_any_element()
     }
 }
 
@@ -729,9 +912,13 @@ impl EditorView {
         cx.notify();
     }
 
+    pub fn active_tool(&self) -> Tool {
+        self.tool
+    }
+
     /// Where a board point is on screen, as of the last frame.
     pub fn board_to_window(&self, x: f32, y: f32) -> Point<Pixels> {
-        let z = self.zoom.value();
+        let z = self.page_scale();
         self.board_origin + point(px(x * z), px(y * z))
     }
 
@@ -740,7 +927,7 @@ impl EditorView {
     }
 }
 
-fn sticky_shadow(lifted: bool) -> Vec<BoxShadow> {
+fn item_shadow(lifted: bool) -> Vec<BoxShadow> {
     let (y, blur, alpha) = if lifted { (14., 28., 0.55) } else { (6., 14., 0.45) };
     vec![BoxShadow {
         color: hsla(0., 0., 0., alpha),
@@ -810,6 +997,57 @@ fn image_size(bytes: &[u8]) -> Option<(u32, u32)> {
         }
     }
     None
+}
+
+fn text_highlight(style: &quill_store::BoardTextStyle) -> HighlightStyle {
+    HighlightStyle {
+        color: style.typography.color.map(|c| rgb(c).into()),
+        font_weight: style.marks.contains(Marks::BOLD).then_some(FontWeight::BOLD),
+        font_style: style.marks.contains(Marks::ITALIC).then_some(FontStyle::Italic),
+        underline: style.marks.contains(Marks::UNDERLINE).then_some(UnderlineStyle {
+            thickness: px(1.),
+            color: None,
+            wavy: false,
+        }),
+        strikethrough: style
+            .marks
+            .contains(Marks::STRIKE)
+            .then_some(StrikethroughStyle { thickness: px(1.), color: None }),
+        background_color: style.marks.contains(Marks::HIGHLIGHT).then(|| rgba(0xd9ad3655).into()),
+        ..Default::default()
+    }
+}
+
+fn text_height(text: &str, style: &quill_store::BoardTextStyle, width: f32, window: &mut Window) -> f32 {
+    let size = style.typography.size.unwrap_or(16) as f32;
+    let mut font = font(crate::editor::formatting::font_family(style.typography.typeface));
+    if style.marks.contains(Marks::BOLD) {
+        font.weight = FontWeight::BOLD;
+    }
+    if style.marks.contains(Marks::ITALIC) {
+        font.style = FontStyle::Italic;
+    }
+    let run = TextRun {
+        len: text.len(),
+        font,
+        color: theme::text().into(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    window
+        .text_system()
+        .shape_text(text.to_owned().into(), px(size), &[run], Some(px(width.max(16.))), None)
+        .map(|lines| lines.iter().map(|l| f32::from(l.size(px(size * 1.5)).height)).sum::<f32>().max(size * 1.5))
+        .unwrap_or(size * 1.5)
+}
+
+fn grow_text_item(item: &mut BoardItem, window: &mut Window) {
+    if let Some((text, style)) = item.kind.text() {
+        let padding = if matches!(item.kind, ItemKind::Shape { .. }) { 24. } else { 0. };
+        let height = text_height(text, style, item.w - padding, window) + padding + 2.;
+        item.h = item.h.max(height);
+    }
 }
 
 #[cfg(test)]

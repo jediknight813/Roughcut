@@ -8,7 +8,7 @@ mod board;
 mod revisions;
 
 pub use backup::Recovery;
-pub use board::{AssetId, BoardItem, ItemId, ItemKind};
+pub use board::{AssetId, BoardItem, BoardTextStyle, ItemId, ItemKind};
 pub use revisions::{RevId, Revision};
 
 use std::collections::HashMap;

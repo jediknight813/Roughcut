@@ -13,6 +13,9 @@ macro_rules! icons {
 }
 
 static ICONS: &[(&str, &[u8])] = icons!(
+    "align-left",
+    "align-center",
+    "align-right",
     "bold",
     "check",
     "chevron-left",
@@ -61,6 +64,9 @@ pub struct Assets;
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        if path == "brand/roughcut-mark.png" {
+            return Ok(Some(Cow::Borrowed(include_bytes!("../assets/brand/roughcut-mark.png"))));
+        }
         match ICONS.iter().find(|(p, _)| *p == path) {
             Some((_, bytes)) => Ok(Some(Cow::Borrowed(bytes))),
             None => gpui_kit::assets::Assets.load(path),

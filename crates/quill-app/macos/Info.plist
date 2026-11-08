@@ -3,13 +3,16 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>Quill</string>
+    <string>Roughcut</string>
     <key>CFBundleDisplayName</key>
-    <string>Quill</string>
+    <string>Roughcut</string>
+    <!-- Keep the established application identity and macOS permissions. -->
     <key>CFBundleIdentifier</key>
     <string>app.quill.Quill</string>
     <key>CFBundleExecutable</key>
-    <string>quill</string>
+    <string>roughcut</string>
+    <key>CFBundleIconFile</key>
+    <string>Roughcut.icns</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -27,6 +30,6 @@
     <key>NSSupportsAutomaticGraphicsSwitching</key>
     <true/>
     <key>NSAppleEventsUsageDescription</key>
-    <string>Quill controls the Spotify app on this Mac to show what's playing.</string>
+    <string>Roughcut connects to Spotify and Apple Music on this Mac to show playback and control your music.</string>
 </dict>
 </plist>

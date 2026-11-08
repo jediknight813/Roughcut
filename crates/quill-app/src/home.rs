@@ -77,7 +77,7 @@ impl HomeView {
         let library = self.library.borrow();
         let docs = if query.trim().is_empty() { library.list(self.filter.as_deref()) } else { library.search(&query) };
         self.docs = docs.unwrap_or_else(|err| {
-            eprintln!("quill: listing documents failed: {err}");
+            eprintln!("roughcut: listing documents failed: {err}");
             Vec::new()
         });
         if !query.trim().is_empty()
@@ -101,7 +101,7 @@ impl HomeView {
         let created = self.library.borrow_mut().create(&Document::new("Untitled"), self.filter.as_deref());
         match created {
             Ok(id) => cx.emit(HomeEvent::Open(id)),
-            Err(err) => eprintln!("quill: creating a document failed: {err}"),
+            Err(err) => eprintln!("roughcut: creating a document failed: {err}"),
         }
     }
 
@@ -115,7 +115,9 @@ impl HomeView {
             .bg(theme::surface())
             .border_b_1()
             .border_color(theme::border())
-            .child(div().font_family(theme::PAGE_FONT).text_size(px(24.)).font_weight(FontWeight::BOLD).child("Quill"))
+            .child(div().flex().items_center().gap(px(10.)).child(img("brand/roughcut-mark.png").size(px(38.))).child(
+                div().font_family(theme::PAGE_FONT).text_size(px(24.)).font_weight(FontWeight::BOLD).child("Roughcut"),
+            ))
             .child(div().flex_1())
             .child(
                 div().w(px(380.)).child(

@@ -1,0 +1,6 @@
+Roughcut app icon
+Generated with the built-in image_gen tool.
+The master PNG retains the original transparent artwork. scripts/build-app-icon.sh
+packages it as standard macOS icon sizes and creates the small in-app brand image.
+
+Use case: logo-brand. Create the finished macOS app icon for Roughcut, a focused writing app with pages and a creative whiteboard. A single bold, original R monogram constructed from two or three overlapping cut-paper shapes, with one decisive diagonal cut suggesting a rough draft becoming finished work. Warm ivory paper and a restrained periwinkle accent (#7b9af0) on a deep charcoal (#17191e) rounded-square tile. Subtle tactile paper edges, gentle dimensional shadows, precise silhouette, understated premium desktop-app finish. Centered front-facing icon, generous visual weight, exceptionally legible at 32 pixels. Square 1024x1024 composition; rounded tile occupies about 88% of canvas, with truly transparent space outside the tile and a small soft shadow. No wordmark, no words, no extra lettering beyond the abstract R, no mockup, no border framing the image.

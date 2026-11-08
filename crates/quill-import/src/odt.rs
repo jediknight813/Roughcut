@@ -1,4 +1,4 @@
-//! OpenDocument text (LibreOffice, Pages export, older Google Docs exports).
+//! OpenDocument text from compatible word processors.
 
 use std::collections::HashMap;
 use std::io::{Cursor, Read};

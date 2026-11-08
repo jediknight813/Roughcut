@@ -4,6 +4,7 @@
 
 use std::collections::HashSet;
 use std::ops::Range;
+use std::sync::{Arc, OnceLock};
 
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -11,15 +12,19 @@ const AFF: &str = include_str!("../dictionaries/en_US.aff");
 const DIC: &str = include_str!("../dictionaries/en_US.dic");
 const MAX_SUGGESTIONS: usize = 5;
 
+#[derive(Clone)]
 pub struct Speller {
-    dict: spellbook::Dictionary,
+    dict: Arc<spellbook::Dictionary>,
     /// Learned words, lowercased.
     personal: HashSet<String>,
 }
 
 impl Speller {
     pub fn english() -> Speller {
-        let dict = spellbook::Dictionary::new(AFF, DIC).expect("bundled dictionary parses");
+        static DICTIONARY: OnceLock<Arc<spellbook::Dictionary>> = OnceLock::new();
+        let dict = DICTIONARY
+            .get_or_init(|| Arc::new(spellbook::Dictionary::new(AFF, DIC).expect("bundled dictionary parses")))
+            .clone();
         Speller { dict, personal: HashSet::new() }
     }
 
@@ -39,16 +44,21 @@ impl Speller {
     /// Byte ranges of misspelled words in `text`. Web addresses, email
     /// addresses, numbers and all-caps abbreviations are left alone.
     pub fn misspellings(&self, text: &str) -> Vec<Range<usize>> {
-        let ignored: Vec<Range<usize>> = text
+        let mut ignored = text
             .split_whitespace()
             .filter(|token| token.contains("://") || token.contains('@') || token.starts_with("www."))
             .map(|token| {
                 let start = token.as_ptr() as usize - text.as_ptr() as usize;
                 start..start + token.len()
             })
-            .collect();
+            .peekable();
         text.unicode_word_indices()
-            .filter(|(start, _)| !ignored.iter().any(|r| r.contains(start)))
+            .filter(|(start, _)| {
+                while ignored.peek().is_some_and(|r| r.end <= *start) {
+                    ignored.next();
+                }
+                !ignored.peek().is_some_and(|r| r.contains(start))
+            })
             .filter(|(_, word)| !self.is_correct(word))
             .map(|(start, word)| start..start + word.len())
             .collect()
