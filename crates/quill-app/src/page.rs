@@ -18,6 +18,17 @@ struct BlockStyle {
     space_after: f32,
 }
 
+impl BlockStyle {
+    fn scaled(self, scale: f32) -> BlockStyle {
+        BlockStyle {
+            size: self.size * scale,
+            indent: self.indent * scale,
+            space_after: self.space_after * scale,
+            ..self
+        }
+    }
+}
+
 fn block_style(kind: BlockKind) -> BlockStyle {
     let body = BlockStyle { size: 18., weight: FontWeight::NORMAL, italic: false, indent: 0., space_after: 14. };
     match kind {
@@ -42,25 +53,38 @@ pub struct BlockLayout {
 pub struct PageLayout {
     pub blocks: Vec<BlockLayout>,
     pub height: Pixels,
-    /// Left edge of the text column.
+    /// Left edge and width of the text column.
     left: Pixels,
+    width: Pixels,
+    scale: f32,
 }
 
 impl PageLayout {
-    pub fn shape(doc: &Document, window: &mut Window) -> PageLayout {
+    /// Lays out `doc` at `scale` (1.0 = writing size). With `dim_except`,
+    /// every block but that one is faded, for focus mode.
+    pub fn shape(doc: &Document, scale: f32, dim_except: Option<usize>, window: &mut Window) -> PageLayout {
         let mut y = px(0.);
         let mut number = 0;
         let blocks = doc
             .blocks
             .iter()
-            .map(|block| {
-                let style = block_style(block.kind);
+            .enumerate()
+            .map(|(i, block)| {
+                let style = block_style(block.kind).scaled(scale);
+                let color: Hsla =
+                    if dim_except.is_some_and(|keep| keep != i) { theme::text_dimmed() } else { theme::text().into() };
                 let font_size = px(style.size);
                 let line_height = px(style.size * 1.6);
-                let runs = runs(block, &style);
+                let runs = runs(block, &style, color);
                 let line = window
                     .text_system()
-                    .shape_text(block.text().into(), font_size, &runs, Some(px(TEXT_WIDTH - style.indent)), None)
+                    .shape_text(
+                        block.text().into(),
+                        font_size,
+                        &runs,
+                        Some(px(TEXT_WIDTH * scale - style.indent)),
+                        None,
+                    )
                     .ok()
                     .and_then(|lines| lines.into_iter().next())
                     .unwrap_or_default();
@@ -71,7 +95,7 @@ impl PageLayout {
                     _ => None,
                 }
                 .map(|text| {
-                    let run = TextRun { len: text.len(), ..plain_run(&style) };
+                    let run = TextRun { len: text.len(), ..plain_run(&style, color) };
                     window.text_system().shape_line(text.into(), font_size, &[run], None)
                 });
                 let height = line.size(line_height).height.max(line_height);
@@ -80,7 +104,7 @@ impl PageLayout {
                 layout
             })
             .collect();
-        PageLayout { blocks, height: y, left: px(0.) }
+        PageLayout { blocks, height: y, left: px(0.), width: px(TEXT_WIDTH * scale), scale }
     }
 
     fn translate(&mut self, by: Point<Pixels>) {
@@ -129,7 +153,7 @@ impl PageLayout {
             };
             let lh = block.line_height;
             let left = block.origin.x;
-            let right = self.left + px(TEXT_WIDTH);
+            let right = self.left + self.width;
             // Selections running past the end of a block cover a little space
             // so a selected empty line or line break is still visible.
             let tail = if i < end.block { px(8.) } else { px(0.) };
@@ -151,7 +175,7 @@ impl PageLayout {
     }
 }
 
-fn plain_run(style: &BlockStyle) -> TextRun {
+fn plain_run(style: &BlockStyle, color: Hsla) -> TextRun {
     TextRun {
         len: 0,
         font: Font {
@@ -159,15 +183,15 @@ fn plain_run(style: &BlockStyle) -> TextRun {
             style: if style.italic { FontStyle::Italic } else { FontStyle::Normal },
             ..font(theme::PAGE_FONT)
         },
-        color: theme::text().into(),
+        color,
         background_color: None,
         underline: None,
         strikethrough: None,
     }
 }
 
-fn runs(block: &Block, style: &BlockStyle) -> Vec<TextRun> {
-    let base = plain_run(style);
+fn runs(block: &Block, style: &BlockStyle, color: Hsla) -> Vec<TextRun> {
+    let base = plain_run(style, color);
     block
         .spans
         .iter()
@@ -229,9 +253,10 @@ impl Element for PageElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        let layout = PageLayout::shape(&self.editor.read(cx).doc, window);
+        let editor = self.editor.read(cx);
+        let layout = PageLayout::shape(&editor.doc, editor.page_scale(), editor.dim_except(), window);
         let mut style = Style::default();
-        style.size.width = px(TEXT_WIDTH).into();
+        style.size.width = layout.width.into();
         style.size.height = layout.height.into();
         (window.request_layout(style, [], cx), Some(layout))
     }
@@ -277,11 +302,12 @@ impl Element for PageElement {
             let _ = block.line.paint_background(block.origin, block.line_height, TextAlign::Left, None, window, cx);
             let _ = block.line.paint(block.origin, block.line_height, TextAlign::Left, None, window, cx);
             if let Some(marker) = &block.marker {
-                let at = point(block.origin.x - px(22.), block.origin.y);
+                let at = point(block.origin.x - px(22. * layout.scale), block.origin.y);
                 let _ = marker.paint(at, block.line_height, TextAlign::Left, None, window, cx);
             }
         }
         if focus.is_focused(window)
+            && self.editor.read(cx).caret_on
             && self.editor.read(cx).mode != crate::editor::Mode::Board
             && let Some(caret) = prepainted.caret.take()
         {

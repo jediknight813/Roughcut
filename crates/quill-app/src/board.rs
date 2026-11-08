@@ -1,15 +1,20 @@
 //! The whiteboard around the page: rendering board items and the tools that
-//! create and move them. Board coordinates are page pixels with the origin
-//! at the page's top centre (see `quill_store::BoardItem`).
+//! create and move them. Board coordinates are page pixels at writing size
+//! with the origin at the page's top centre (see `quill_store::BoardItem`);
+//! on screen they are multiplied by the editor's current zoom.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use quill_store::{BoardItem, ItemId, ItemKind};
 
-use crate::editor::{EditorView, Mode};
+use crate::anim;
+use crate::assets::icon;
+use crate::editor::{EditorView, Mode, floating_shadow};
 use crate::theme;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -33,20 +38,34 @@ impl Tool {
             Tool::Select => "Select",
             Tool::Pen => "Pen",
             Tool::Highlighter => "Highlighter",
-            Tool::Sticky => "Sticky",
+            Tool::Sticky => "Sticky note",
             Tool::Shape => "Shape",
             Tool::Text => "Text",
             Tool::Image => "Image",
             Tool::Eraser => "Eraser",
         }
     }
+
+    fn icon(self) -> &'static str {
+        match self {
+            Tool::Select => "mouse-pointer-2",
+            Tool::Pen => "pen-line",
+            Tool::Highlighter => "highlighter",
+            Tool::Sticky => "sticky-note",
+            Tool::Shape => "square",
+            Tool::Text => "type",
+            Tool::Image => "image",
+            Tool::Eraser => "eraser",
+        }
+    }
 }
 
-pub const NOTE_COLORS: [u32; 4] = [0xfde047, 0xf9a8d4, 0x93c5fd, 0x86efac];
+pub const NOTE_COLORS: [u32; 4] = [0xfde68a, 0xfbcfe8, 0xbfdbfe, 0xbbf7d0];
 const STICKY_SIZE: (f32, f32) = (200., 150.);
 const PEN_WIDTH: f32 = 2.5;
 const HIGHLIGHTER_WIDTH: f32 = 14.;
 const HIGHLIGHTER_COLOR: u32 = 0xfacc15;
+const STICKY_INK: u32 = 0x2b2618;
 
 pub enum Gesture {
     Drawing { points: Vec<Point<Pixels>>, highlighter: bool },
@@ -68,9 +87,11 @@ impl EditorView {
         }
     }
 
-    /// Window position -> board coordinates.
+    /// Window position -> board coordinates (unscaled page pixels).
     fn to_board(&self, p: Point<Pixels>) -> Point<Pixels> {
-        p - self.board_origin
+        let z = self.zoom.value().max(0.01);
+        let d = p - self.board_origin;
+        point(d.x / z, d.y / z)
     }
 
     pub(crate) fn board_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -81,6 +102,7 @@ impl EditorView {
         if self.mode != Mode::Board {
             return;
         }
+        window.focus(&self.focus_handle, cx);
         self.stop_editing_item(cx);
         self.selected_item = None;
         let p = self.to_board(event.position);
@@ -97,13 +119,8 @@ impl EditorView {
                 }
             }
             Tool::Text => {
-                if let Some(id) = self.add_item(
-                    f32::from(p.x),
-                    f32::from(p.y) - 12.,
-                    260.,
-                    60.,
-                    ItemKind::Text { text: String::new() },
-                ) {
+                let kind = ItemKind::Text { text: String::new() };
+                if let Some(id) = self.add_item(f32::from(p.x), f32::from(p.y) - 12., 260., 60., kind) {
                     self.edit_item(id, window, cx);
                 }
             }
@@ -182,10 +199,17 @@ impl EditorView {
         if self.mode != Mode::Board {
             return;
         }
-        cx.stop_propagation();
         match self.tool {
-            Tool::Eraser => self.remove_item(id, cx),
+            Tool::Eraser => {
+                cx.stop_propagation();
+                self.remove_item(id, cx);
+            }
+            Tool::Pen | Tool::Highlighter => {
+                // Let the board start a stroke over the item.
+            }
             Tool::Select | Tool::Sticky | Tool::Text | Tool::Shape | Tool::Image => {
+                cx.stop_propagation();
+                window.focus(&self.focus_handle, cx);
                 let editable = self
                     .board
                     .iter()
@@ -206,10 +230,6 @@ impl EditorView {
                         Some(Gesture::Dragging { id, grab: self.to_board(event.position), start: (item.x, item.y) });
                 }
                 cx.notify();
-            }
-            Tool::Pen | Tool::Highlighter => {
-                // Draw over items too.
-                cx.propagate();
             }
         }
     }
@@ -282,13 +302,13 @@ impl EditorView {
         }
     }
 
+    /// Pen strokes use a stronger version of the chosen note colour so they
+    /// read on the dark board.
     fn pen_color(&self) -> u32 {
-        // Pen strokes use a stronger version of the chosen note color so
-        // they read on the dark board.
         match self.note_color {
-            0xfde047 => 0xfacc15,
-            0xf9a8d4 => 0xf472b6,
-            0x93c5fd => 0x7b9af0,
+            0xfde68a => 0xfacc15,
+            0xfbcfe8 => 0xf472b6,
+            0xbfdbfe => 0x7b9af0,
             _ => 0x4ade80,
         }
     }
@@ -388,9 +408,10 @@ impl EditorView {
     }
 
     /// The board layer: a zero-size anchor at the page's top centre with
-    /// every item absolutely positioned around it.
-    pub(crate) fn render_board(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// every item absolutely positioned (and scaled) around it.
+    pub(crate) fn render_board(&mut self, opacity: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let interactive = self.mode == Mode::Board;
+        let z = self.zoom.value();
         let entity = cx.entity();
         let items: Vec<BoardItem> = self.board.clone();
         let mut children: Vec<AnyElement> = Vec::new();
@@ -401,39 +422,69 @@ impl EditorView {
             let base = div()
                 .id(("item", id as u64))
                 .absolute()
-                .left(px(item.x))
-                .top(px(item.y))
-                .w(px(item.w))
-                .h(px(item.h))
-                .when(selected, |d| d.border_2().border_color(theme::accent()))
+                .left(px(item.x * z))
+                .top(px(item.y * z))
+                .w(px(item.w * z))
+                .h(px(item.h * z))
                 .when(interactive, |d| {
-                    d.on_mouse_down(
+                    d.cursor(if self.tool == Tool::Eraser {
+                        CursorStyle::OperationNotAllowed
+                    } else {
+                        CursorStyle::OpenHand
+                    })
+                    .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, ev, w, cx| this.item_mouse_down(id, ev, w, cx)),
                     )
                 });
             let element = match &item.kind {
                 ItemKind::Sticky { text, color } => base
-                    .p(px(14.))
+                    .rounded(px(3.))
                     .bg(rgb(*color))
-                    .shadow_md()
-                    .text_color(rgb(0x1f1d18))
-                    .font_family("Noteworthy")
-                    .text_size(px(18.))
-                    .line_height(px(24.))
+                    .shadow(sticky_shadow(selected))
+                    .when(selected, |d| d.border_2().border_color(theme::accent()))
                     .overflow_hidden()
-                    .child(match editing {
-                        Some(state) => Textarea::new(&state).appearance(false).h_full().into_any_element(),
-                        None => div().child(text.clone()).into_any_element(),
-                    })
+                    .child(div().h(px(14. * z)).bg(rgba(0x0000000d)))
+                    .child(
+                        div()
+                            .px(px(14. * z))
+                            .pt(px(6. * z))
+                            .text_color(rgb(STICKY_INK))
+                            .font_family(theme::NOTE_FONT)
+                            .text_size(px(19. * z))
+                            .line_height(px(25. * z))
+                            .child(match editing {
+                                Some(state) => Textarea::new(&state)
+                                    .appearance(false)
+                                    .p_0()
+                                    .h(px((item.h - 30.) * z))
+                                    .font_family(theme::NOTE_FONT)
+                                    .text_size(px(19. * z))
+                                    .line_height(px(25. * z))
+                                    .text_color(rgb(STICKY_INK))
+                                    .into_any_element(),
+                                None => div().child(text.clone()).into_any_element(),
+                            }),
+                    )
                     .into_any_element(),
                 ItemKind::Text { text } => base
-                    .p(px(4.))
-                    .text_color(theme::text())
+                    .p(px(4. * z))
+                    .rounded(px(6.))
+                    .when(selected, |d| d.border_1().border_color(theme::accent()))
+                    .text_color(theme::text_soft())
                     .font_family(theme::PAGE_FONT)
-                    .text_size(px(16.))
+                    .italic()
+                    .text_size(px(16. * z))
+                    .line_height(px(24. * z))
                     .child(match editing {
-                        Some(state) => Textarea::new(&state).appearance(false).h_full().into_any_element(),
+                        Some(state) => Textarea::new(&state)
+                            .appearance(false)
+                            .p_0()
+                            .h_full()
+                            .font_family(theme::PAGE_FONT)
+                            .text_size(px(16. * z))
+                            .line_height(px(24. * z))
+                            .into_any_element(),
                         None => div().child(text.clone()).into_any_element(),
                     })
                     .into_any_element(),
@@ -441,25 +492,44 @@ impl EditorView {
                     .border_2()
                     .border_color(rgb(*color))
                     .when(*ellipse, |d| d.rounded_full())
-                    .when(!*ellipse, |d| d.rounded(px(6.)))
+                    .when(!*ellipse, |d| d.rounded(px(8. * z)))
+                    .when(selected, |d| d.bg(rgba(0x7b9af01a)))
                     .into_any_element(),
                 ItemKind::Stroke { points, color, width } => {
                     let (points, color, width) = (points.clone(), *color, *width);
-                    base.child(
-                        canvas(
-                            |_, _, _| {},
-                            move |bounds, _, window, _| paint_stroke(bounds.origin, &points, color, width, window),
+                    base.when(selected, |d| d.border_1().border_color(rgba(0x7b9af080)).rounded(px(4.)))
+                        .child(
+                            canvas(
+                                |_, _, _| {},
+                                move |bounds, _, window, _| {
+                                    paint_stroke(bounds.origin, &points, z, color, width, window)
+                                },
+                            )
+                            .size_full(),
                         )
-                        .size_full(),
-                    )
-                    .into_any_element()
+                        .into_any_element()
                 }
                 ItemKind::Image { asset } => match self.image(*asset) {
-                    Some(image) => base.child(img(image).size_full().rounded(px(6.))).into_any_element(),
-                    None => base.bg(theme::raised()).into_any_element(),
+                    Some(image) => base
+                        .rounded(px(8.))
+                        .overflow_hidden()
+                        .shadow(sticky_shadow(selected))
+                        .when(selected, |d| d.border_2().border_color(theme::accent()))
+                        .child(img(image).size_full())
+                        .into_any_element(),
+                    None => base.bg(theme::raised()).rounded(px(8.)).into_any_element(),
                 },
             };
-            children.push(element);
+            // New items pop in; existing ones are already settled.
+            children.push(
+                div()
+                    .absolute()
+                    .child(element)
+                    .with_animation(("appear", id as u64), Animation::new(Duration::from_millis(260)), |el, t| {
+                        el.opacity(anim::ease_out(t))
+                    })
+                    .into_any_element(),
+            );
         }
 
         // The stroke or shape being drawn right now.
@@ -471,7 +541,7 @@ impl EditorView {
                 children.push(
                     canvas(
                         |_, _, _| {},
-                        move |bounds, _, window, _| paint_stroke(bounds.origin, &points, color, width, window),
+                        move |bounds, _, window, _| paint_stroke(bounds.origin, &points, z, color, width, window),
                     )
                     .absolute()
                     .size_0()
@@ -483,13 +553,13 @@ impl EditorView {
                 children.push(
                     div()
                         .absolute()
-                        .left(min.x)
-                        .top(min.y)
-                        .w(max.x - min.x)
-                        .h(max.y - min.y)
+                        .left(min.x * z)
+                        .top(min.y * z)
+                        .w((max.x - min.x) * z)
+                        .h((max.y - min.y) * z)
                         .border_2()
                         .border_color(rgb(self.pen_color()))
-                        .rounded(px(6.))
+                        .rounded(px(8. * z))
                         .into_any_element(),
                 );
             }
@@ -501,7 +571,7 @@ impl EditorView {
             .left(relative(0.5))
             .top(px(crate::editor::PAGE_TOP))
             .size_0()
-            .when(self.mode == Mode::Page, |d| d.opacity(0.28))
+            .opacity(opacity)
             .child(
                 canvas(
                     move |bounds, _, cx| {
@@ -514,47 +584,58 @@ impl EditorView {
             .children(children)
     }
 
-    pub(crate) fn tool_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The floating board toolbar. `presence` (0–1) fades and shrinks it a
+    /// little while writing so it stays out of the way.
+    pub(crate) fn tool_bar(&self, presence: f32, cx: &mut Context<Self>) -> impl IntoElement {
+        let board = self.mode == Mode::Board;
         div()
             .flex()
             .items_center()
             .gap(px(2.))
-            .p(px(6.))
+            .p(px(5.))
             .rounded(px(14.))
-            .bg(theme::surface())
+            .bg(rgba(0x1d2027f2))
             .border_1()
             .border_color(theme::border())
-            .shadow_lg()
+            .shadow(floating_shadow())
+            .opacity(presence)
             .children(Tool::ALL.into_iter().map(|tool| {
-                let active = self.tool == tool;
+                let active = board && self.tool == tool;
                 div()
                     .id(tool.label())
-                    .px(px(10.))
-                    .h(px(40.))
+                    .size(px(38.))
                     .flex()
                     .items_center()
+                    .justify_center()
                     .rounded(px(10.))
                     .cursor_pointer()
-                    .text_size(px(13.))
-                    .when(active, |d| d.bg(theme::selected_bg()).text_color(theme::accent()))
-                    .hover(|s| s.bg(theme::raised()))
-                    .child(tool.label())
+                    .when(active, |d| d.bg(theme::selected_bg()))
+                    .when(!active, |d| d.hover(|s| s.bg(theme::raised())))
+                    .child(icon(tool.icon()).size(px(18.)).text_color(if active {
+                        theme::accent()
+                    } else {
+                        theme::text_soft()
+                    }))
+                    .tooltip(move |window, cx| Tooltip::new(tool.label()).build(window, cx))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.tool = tool;
                         this.set_mode(Mode::Board, window, cx);
                     }))
             }))
-            .child(div().w(px(1.)).h(px(26.)).mx(px(6.)).bg(theme::border()))
+            .child(div().w(px(1.)).h(px(24.)).mx(px(6.)).bg(theme::border()))
             .children(NOTE_COLORS.into_iter().map(|color| {
                 let active = self.note_color == color;
                 div()
                     .id(("color", color as u64))
-                    .size(px(22.))
-                    .mx(px(3.))
+                    .size(px(26.))
+                    .mx(px(1.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
                     .rounded_full()
                     .cursor_pointer()
-                    .bg(rgb(color))
-                    .when(active, |d| d.border_2().border_color(theme::text()))
+                    .when(active, |d| d.border_2().border_color(theme::text_soft()))
+                    .child(div().size(px(18.)).rounded_full().bg(rgb(color)))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.note_color = color;
                         cx.notify();
@@ -563,12 +644,29 @@ impl EditorView {
     }
 }
 
-fn paint_stroke(origin: Point<Pixels>, points: &[(f32, f32)], color: u32, width: f32, window: &mut Window) {
+fn sticky_shadow(lifted: bool) -> Vec<BoxShadow> {
+    let (y, blur, alpha) = if lifted { (14., 28., 0.55) } else { (6., 14., 0.45) };
+    vec![BoxShadow {
+        color: hsla(0., 0., 0., alpha),
+        offset: point(px(0.), px(y)),
+        blur_radius: px(blur),
+        spread_radius: px(0.),
+        inset: false,
+    }]
+}
+
+fn paint_stroke(origin: Point<Pixels>, points: &[(f32, f32)], zoom: f32, color: u32, width: f32, window: &mut Window) {
     let Some(&(x0, y0)) = points.first() else { return };
-    let mut path = PathBuilder::stroke(px(width));
-    path.move_to(origin + point(px(x0), px(y0)));
-    for &(x, y) in &points[1..] {
-        path.line_to(origin + point(px(x), px(y)));
+    let at = |x: f32, y: f32| origin + point(px(x * zoom), px(y * zoom));
+    let mut path = PathBuilder::stroke(px(width * zoom));
+    path.move_to(at(x0, y0));
+    // Smooth through midpoints so freehand strokes don't look jagged.
+    for pair in points.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        path.curve_to(at((a.0 + b.0) / 2., (a.1 + b.1) / 2.), at(a.0, a.1));
+    }
+    if let Some(&(x, y)) = points.last() {
+        path.line_to(at(x, y));
     }
     if let Ok(path) = path.build() {
         let alpha = if width >= HIGHLIGHTER_WIDTH { 0x66 } else { 0xff };

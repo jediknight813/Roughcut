@@ -3,19 +3,24 @@
 use gpui_kit::{Hsla, Rgba, rgb, rgba};
 
 pub fn app_bg() -> Rgba {
-    rgb(0x111318)
+    rgb(0x0f1115)
 }
 
 pub fn surface() -> Rgba {
-    rgb(0x1a1d23)
+    rgb(0x17191e)
 }
 
 pub fn raised() -> Rgba {
-    rgb(0x23272f)
+    rgb(0x262a32)
 }
 
 pub fn border() -> Rgba {
-    rgb(0x2a2e37)
+    rgb(0x262a33)
+}
+
+/// The writing surface: lifted off the board, distinct from window chrome.
+pub fn page() -> Rgba {
+    rgb(0x1c1f26)
 }
 
 pub fn text() -> Rgba {
@@ -46,9 +51,14 @@ pub fn selection() -> Hsla {
     rgba(0x7b9af04d).into()
 }
 
+pub fn text_dimmed() -> Hsla {
+    rgba(0xe6e8ec47).into()
+}
+
 pub fn highlight() -> Hsla {
     rgba(0xfacc1559).into()
 }
 
 pub const UI_FONT: &str = ".SystemUIFont";
 pub const PAGE_FONT: &str = "Georgia";
+pub const NOTE_FONT: &str = "Noteworthy";

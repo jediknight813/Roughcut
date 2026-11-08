@@ -1,4 +1,7 @@
+mod anim;
+mod assets;
 mod board;
+mod demo;
 mod editor;
 mod home;
 mod import;
@@ -6,6 +9,8 @@ mod media;
 mod page;
 mod storage;
 mod theme;
+#[cfg(feature = "screenshots")]
+mod tour;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -31,6 +36,8 @@ enum Screen {
 
 struct QuillApp {
     library: Rc<RefCell<Library>>,
+    /// Bumped on every screen change so the new screen animates in.
+    screen_gen: usize,
     media: Entity<Media>,
     screen: Screen,
     _subscription: Subscription,
@@ -40,7 +47,7 @@ impl QuillApp {
     fn new(library: Rc<RefCell<Library>>, notice: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let media = cx.new(Media::new);
         let (screen, subscription) = Self::home(library.clone(), notice, window, cx);
-        QuillApp { library, media, screen, _subscription: subscription }
+        QuillApp { library, screen_gen: 0, media, screen, _subscription: subscription }
     }
 
     fn home(
@@ -60,6 +67,7 @@ impl QuillApp {
     fn show_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (screen, subscription) = Self::home(self.library.clone(), None, window, cx);
         self.screen = screen;
+        self.screen_gen += 1;
         self._subscription = subscription;
         cx.notify();
     }
@@ -70,7 +78,34 @@ impl QuillApp {
             ImportEvent::Done => this.show_home(window, cx),
         });
         self.screen = Screen::Import(import);
+        self.screen_gen += 1;
         cx.notify();
+    }
+
+    #[cfg_attr(not(feature = "screenshots"), allow(dead_code))]
+    fn open_titled(&mut self, title: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let id = self
+            .library
+            .borrow()
+            .list(None)
+            .ok()
+            .and_then(|docs| docs.into_iter().find(|d| d.title == title))
+            .map(|d| d.id);
+        if let Some(id) = id {
+            self.open(id, window, cx);
+        }
+    }
+
+    #[cfg_attr(not(feature = "screenshots"), allow(dead_code))]
+    fn with_editor(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut EditorView, &mut Window, &mut Context<EditorView>),
+    ) {
+        if let Screen::Editor(editor) = &self.screen {
+            editor.update(cx, |e, cx| f(e, window, cx));
+        }
     }
 
     fn open(&mut self, id: DocId, window: &mut Window, cx: &mut Context<Self>) {
@@ -88,18 +123,24 @@ impl QuillApp {
             EditorEvent::Close => this.show_home(window, cx),
         });
         self.screen = Screen::Editor(editor);
+        self.screen_gen += 1;
         cx.notify();
     }
 }
 
 impl Render for QuillApp {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        let screen = div().size_full();
-        match &self.screen {
-            Screen::Home(home) => screen.child(home.clone()),
-            Screen::Import(import) => screen.child(import.clone()),
-            Screen::Editor(editor) => screen.child(editor.clone()),
-        }
+        let view = match &self.screen {
+            Screen::Home(home) => home.clone().into_any_element(),
+            Screen::Import(import) => import.clone().into_any_element(),
+            Screen::Editor(editor) => editor.clone().into_any_element(),
+        };
+        // Each screen settles in: a short fade with a slight rise.
+        div().size_full().bg(theme::app_bg()).child(div().size_full().child(view).with_animation(
+            ("screen", self.screen_gen),
+            Animation::new(anim::STANDARD).with_easing(anim::ease_out),
+            |el, t| el.opacity(t).mt(px((1. - t) * 10.)),
+        ))
     }
 }
 
@@ -132,13 +173,19 @@ fn main() {
         }
     };
     if library.list(None).map(|d| d.is_empty()).unwrap_or(false) {
-        welcome(&mut library);
+        if std::env::var_os("QUILL_DEMO").is_some() {
+            if let Err(err) = demo::seed(&mut library) {
+                eprintln!("quill: seeding demo content failed: {err}");
+            }
+        } else {
+            welcome(&mut library);
+        }
     }
     locations.back_up(&library);
     let library = Rc::new(RefCell::new(library));
     let notice = storage::describe(&recovery);
 
-    gpui_kit::application().run(move |cx| {
+    gpui_kit::application().with_assets(assets::Assets).run(move |cx| {
         gpui_kit::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
         editor::bind_keys(cx);
@@ -163,12 +210,20 @@ fn main() {
         .detach();
 
         let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(1280.), px(860.)), cx))),
+            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(1440.), px(900.)), cx))),
             titlebar: Some(TitlebarOptions { title: Some("Quill".into()), ..Default::default() }),
             ..Default::default()
         };
-        gpui_kit::open_window(options, cx, move |window, cx| cx.new(|cx| QuillApp::new(library, notice, window, cx)))
-            .expect("failed to open window");
+        let window = gpui_kit::open_window(options, cx, move |window, cx| {
+            cx.new(|cx| QuillApp::new(library, notice, window, cx))
+        })
+        .expect("failed to open window");
+        #[cfg(feature = "screenshots")]
+        if let Some(dir) = std::env::var_os("QUILL_SCREENSHOTS") {
+            tour::run(window.0, window.1, dir.into(), cx);
+        }
+        #[cfg(not(feature = "screenshots"))]
+        let _ = window;
         cx.activate(true);
     });
 }

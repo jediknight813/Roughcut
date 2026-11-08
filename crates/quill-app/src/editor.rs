@@ -3,33 +3,45 @@
 //! committed when the run ends or after a short pause, so undo steps feel
 //! like a word processor's while nothing is ever lost.
 //!
-//! The page sits on a whiteboard (see `board.rs`). In Board mode the board
-//! is live and the page is a target to click into; in Page mode the page is
-//! being written and the board dims; Focus mode hides everything but the
-//! text.
+//! The page sits on a whiteboard (see `board.rs`). In Board mode the whole
+//! canvas zooms out so notes and drawings sit around a smaller page; clicking
+//! the page glides it back to full size for writing, with the board fading
+//! behind. Focus mode hides everything but the text and dims every
+//! paragraph except the current one.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use quill_doc::{BlockKind, Document, Marks, Pos};
 use quill_store::{AssetId, BoardItem, DocId, ItemId, Library, Revision};
 
+use crate::anim::{self, Tween};
+use crate::assets::icon;
 use crate::board::{Editing, Gesture, NOTE_COLORS, Tool};
 use crate::media::{Control, Media};
 use crate::page::{PageElement, PageLayout, TEXT_WIDTH};
 use crate::theme;
 
 const COMMIT_AFTER: Duration = Duration::from_millis(800);
+const BLINK: Duration = Duration::from_millis(530);
 /// Distance from the top of the board to the top of the page.
-pub const PAGE_TOP: f32 = 40.;
+pub const PAGE_TOP: f32 = 48.;
 const PAGE_PADDING: (f32, f32) = (80., 72.);
-const HISTORY_SHOWN: usize = 300;
+const PAGE_MIN_HEIGHT: f32 = 1000.;
+/// How far the canvas zooms out in Board mode.
+const BOARD_ZOOM: f32 = 0.78;
+/// How visible the board stays while writing.
+const BOARD_DIMMED: f32 = 0.3;
+const HISTORY_WIDTH: f32 = 300.;
+const HISTORY_SHOWN: usize = 400;
+const DOT_SPACING: f32 = 24.;
 
 actions!(
     editor,
@@ -63,6 +75,8 @@ actions!(
         CloseDocument,
         Escape,
         ToggleFocus,
+        ToggleBoard,
+        ToggleHistory,
     ]
 );
 
@@ -100,6 +114,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-w", CloseDocument, ctx),
         KeyBinding::new("escape", Escape, ctx),
         KeyBinding::new("cmd-shift-f", ToggleFocus, ctx),
+        KeyBinding::new("cmd-shift-b", ToggleBoard, ctx),
+        KeyBinding::new("cmd-shift-y", ToggleHistory, ctx),
     ]);
 }
 
@@ -137,8 +153,14 @@ pub struct EditorView {
     pending: Option<EditKind>,
     commit_task: Option<Task<()>>,
     pub layout: Option<PageLayout>,
+    pub caret_on: bool,
+    last_activity: Instant,
+    _blink: Task<()>,
 
     pub mode: Mode,
+    pub(crate) zoom: Tween,
+    pub(crate) board_fade: Tween,
+    history_slide: Tween,
     pub(crate) board: Vec<BoardItem>,
     pub(crate) tool: Tool,
     pub(crate) note_color: u32,
@@ -175,6 +197,23 @@ impl EditorView {
         let end = doc.end();
         let session_start_words = doc.word_count();
         let observe_media = cx.observe(&media, |_, _, cx| cx.notify());
+        let blink = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(BLINK).await;
+                let alive = this
+                    .update(cx, |this, cx| {
+                        let on = this.last_activity.elapsed() < BLINK || !this.caret_on;
+                        if on != this.caret_on {
+                            this.caret_on = on;
+                            cx.notify();
+                        }
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+            }
+        });
         let mut editor = EditorView {
             focus_handle: cx.focus_handle(),
             library,
@@ -188,7 +227,13 @@ impl EditorView {
             pending: None,
             commit_task: None,
             layout: None,
+            caret_on: true,
+            last_activity: Instant::now(),
+            _blink: blink,
             mode: Mode::Page,
+            zoom: Tween::new(1.),
+            board_fade: Tween::new(BOARD_DIMMED),
+            history_slide: Tween::new(0.),
             board: Vec::new(),
             tool: Tool::Select,
             note_color: NOTE_COLORS[0],
@@ -212,6 +257,20 @@ impl EditorView {
         if self.anchor <= self.head { (self.anchor, self.head) } else { (self.head, self.anchor) }
     }
 
+    /// Current zoom of the page and board, mid-animation included.
+    pub fn page_scale(&self) -> f32 {
+        self.zoom.value()
+    }
+
+    pub fn dim_except(&self) -> Option<usize> {
+        (self.mode == Mode::Focus && self.anchor == self.head).then_some(self.head.block)
+    }
+
+    fn touch(&mut self) {
+        self.last_activity = Instant::now();
+        self.caret_on = true;
+    }
+
     pub(crate) fn set_mode(&mut self, mode: Mode, window: &mut Window, cx: &mut Context<Self>) {
         self.commit();
         self.gesture = None;
@@ -220,6 +279,13 @@ impl EditorView {
             self.selected_item = None;
         }
         self.mode = mode;
+        let (zoom, fade) = match mode {
+            Mode::Board => (BOARD_ZOOM, 1.),
+            Mode::Page | Mode::Focus => (1., BOARD_DIMMED),
+        };
+        self.zoom.set(zoom, anim::STANDARD);
+        self.board_fade.set(fade, anim::STANDARD);
+        self.touch();
         window.focus(&self.focus_handle, cx);
         cx.notify();
     }
@@ -233,7 +299,9 @@ impl EditorView {
         if let Err(err) = self.library.borrow_mut().commit(self.id, &self.doc, self.head, quill_store::today()) {
             eprintln!("quill: saving failed: {err}");
         }
-        self.history = self.history.take().map(|_| self.load_history());
+        if self.history.is_some() {
+            self.history = Some(self.load_history());
+        }
     }
 
     fn edit(&mut self, kind: EditKind, cx: &mut Context<Self>, f: impl FnOnce(&mut Document, Pos, Pos) -> Pos) {
@@ -246,6 +314,7 @@ impl EditorView {
         self.head = pos;
         self.goal_x = None;
         self.pending = Some(kind);
+        self.touch();
         if kind == EditKind::Other {
             self.commit();
         } else {
@@ -274,6 +343,7 @@ impl EditorView {
         if !extend {
             self.anchor = pos;
         }
+        self.touch();
         cx.notify();
     }
 
@@ -368,6 +438,19 @@ impl EditorView {
         self.head = head;
     }
 
+    /// Marks set on the whole selection (or on the character before the caret).
+    fn active_marks(&self) -> Marks {
+        let (start, end) = self.selection();
+        let Some(block) = self.doc.blocks.get(start.block) else { return Marks::NONE };
+        if start == end || start.block != end.block {
+            return block.marks_at(start.offset);
+        }
+        [Marks::BOLD, Marks::ITALIC, Marks::UNDERLINE, Marks::STRIKE, Marks::HIGHLIGHT]
+            .into_iter()
+            .filter(|m| block.all_have(start.offset, end.offset, *m))
+            .fold(Marks::NONE, Marks::with)
+    }
+
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
         if self.mode == Mode::Board && self.undo_board(cx) {
             return;
@@ -397,7 +480,10 @@ impl EditorView {
                 self.anchor = cursor;
                 self.head = cursor;
                 self.marked = None;
-                self.history = self.history.take().map(|_| self.load_history());
+                self.touch();
+                if self.history.is_some() {
+                    self.history = Some(self.load_history());
+                }
                 cx.notify();
             }
             Ok(None) => {}
@@ -412,12 +498,14 @@ impl EditorView {
         revs
     }
 
-    fn toggle_history(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_history(&mut self, cx: &mut Context<Self>) {
         self.commit();
-        self.history = match self.history {
-            Some(_) => None,
-            None => Some(self.load_history()),
-        };
+        if self.history_slide.target() > 0.5 {
+            self.history_slide.set(0., anim::QUICK);
+        } else {
+            self.history = Some(self.load_history());
+            self.history_slide.set(1., anim::STANDARD);
+        }
         cx.notify();
     }
 
@@ -468,7 +556,9 @@ impl EditorView {
                 self.selected_item = None;
                 cx.notify();
             }
-            _ => self.close(&CloseDocument, window, cx),
+            Mode::Board => self.set_mode(Mode::Page, window, cx),
+            Mode::Page if self.history_slide.target() > 0.5 => self.toggle_history(cx),
+            Mode::Page => self.close(&CloseDocument, window, cx),
         }
     }
 
@@ -496,12 +586,13 @@ impl EditorView {
 
     fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         cx.stop_propagation();
+        let Some(layout) = &self.layout else { return };
+        // Hit-test against the layout the user clicked on, before any zoom.
+        let pos = layout.pos_for_point(event.position);
         if self.mode == Mode::Board {
             self.set_mode(Mode::Page, window, cx);
         }
         window.focus(&self.focus_handle, cx);
-        let Some(layout) = &self.layout else { return };
-        let pos = layout.pos_for_point(event.position);
         self.selecting = true;
         self.goal_x = None;
         self.move_to(pos, event.modifiers.shift, cx);
@@ -515,6 +606,7 @@ impl EditorView {
             let pos = layout.pos_for_point(event.position);
             if pos != self.head {
                 self.head = pos;
+                self.touch();
                 cx.notify();
             }
         }
@@ -551,63 +643,84 @@ impl EditorView {
     }
 
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let status = if self.pending.is_some() { "Editing…" } else { "Saved" };
-        let segment = |id: &'static str, label: &'static str, mode: Mode, active: bool, cx: &mut Context<Self>| {
-            div()
-                .id(id)
-                .px(px(14.))
-                .h(px(30.))
-                .flex()
-                .items_center()
-                .rounded(px(7.))
-                .cursor_pointer()
-                .when(active, |d| d.bg(rgb(0x353a45)))
-                .child(label)
-                .on_click(cx.listener(move |this, _, window, cx| this.set_mode(mode, window, cx)))
-        };
+        let saving = self.pending.is_some();
+        let segment =
+            |id: &'static str, glyph: &'static str, label: &'static str, mode: Mode, cx: &mut Context<Self>| {
+                let active = self.mode == mode;
+                div()
+                    .id(id)
+                    .h(px(28.))
+                    .px(px(12.))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .rounded(px(7.))
+                    .cursor_pointer()
+                    .text_size(px(13.))
+                    .text_color(if active { theme::text() } else { theme::muted() })
+                    .when(active, |d| d.bg(rgb(0x3a3f4b)).shadow_sm())
+                    .when(!active, |d| d.hover(|s| s.text_color(theme::text())))
+                    .child(icon(glyph).size(px(15.)).text_color(if active { theme::text() } else { theme::muted() }))
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, window, cx| this.set_mode(mode, window, cx)))
+            };
         div()
             .flex()
-            .flex_wrap()
             .items_center()
-            .gap(px(12.))
-            .px(px(16.))
-            .py(px(8.))
+            .gap(px(10.))
+            .px(px(12.))
+            .h(px(52.))
             .child(
-                tool_button("library", "‹ Library", false)
+                icon_button("library", "chevron-left", "Library (⌘W)", false)
                     .on_click(cx.listener(|this, _, w, cx| this.close(&CloseDocument, w, cx))),
             )
-            .child(div().font_weight(FontWeight::SEMIBOLD).child(self.doc.title.clone()))
-            .child(div().text_size(px(13.)).text_color(theme::muted()).child(status))
+            .child(div().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).child(self.doc.title.clone()))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(5.))
+                    .text_size(px(12.))
+                    .text_color(theme::muted())
+                    .child(icon(if saving { "pen-line" } else { "check" }).size(px(13.)).text_color(theme::muted()))
+                    .child(if saving { "Editing" } else { "Saved" }),
+            )
             .child(div().flex_1())
             .child(
                 div()
                     .flex()
                     .p(px(3.))
+                    .gap(px(2.))
                     .rounded(px(9.))
                     .bg(theme::raised())
-                    .child(segment("mode-board", "Board", Mode::Board, self.mode == Mode::Board, cx))
-                    .child(segment("mode-page", "Page", Mode::Page, self.mode == Mode::Page, cx)),
+                    .child(segment("mode-board", "layers", "Board", Mode::Board, cx))
+                    .child(segment("mode-page", "file-text", "Page", Mode::Page, cx)),
             )
             .child(
-                tool_button("focus", "Focus", false)
+                icon_button("focus", "scan-text", "Focus mode (⇧⌘F)", false)
                     .on_click(cx.listener(|this, _, window, cx| this.set_mode(Mode::Focus, window, cx))),
             )
             .child(
-                tool_button("history", "Version history", self.history.is_some())
+                icon_button("history", "clock", "Version history (⇧⌘Y)", self.history_slide.target() > 0.5)
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_history(cx))),
             )
             .child(
                 div()
                     .id("export")
-                    .px(px(16.))
-                    .h(px(34.))
+                    .ml(px(4.))
+                    .px(px(14.))
+                    .h(px(32.))
                     .flex()
                     .items_center()
+                    .gap(px(7.))
                     .rounded(px(8.))
                     .bg(theme::accent())
                     .text_color(theme::on_accent())
+                    .text_size(px(13.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .cursor_pointer()
+                    .hover(|s| s.bg(rgb(0x93adf3)))
+                    .child(icon("share").size(px(15.)).text_color(theme::on_accent()))
                     .child("Export")
                     .on_click(cx.listener(|this, _, _, cx| this.export(cx))),
             )
@@ -616,130 +729,218 @@ impl EditorView {
     fn toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (start, _) = self.selection();
         let block_kind = self.doc.blocks.get(start.block).map(|b| b.kind);
-        let mark_button = |id: &'static str, label: &'static str, mark: Marks, cx: &mut Context<Self>| {
-            tool_button(id, label, false).on_click(cx.listener(move |this, _, _, cx| this.toggle(mark, cx)))
-        };
-        let kind_button = |id: &'static str, label: &'static str, kind: BlockKind, cx: &mut Context<Self>| {
-            tool_button(id, label, block_kind == Some(kind))
-                .on_click(cx.listener(move |this, _, _, cx| this.set_block_kind(kind, cx)))
-        };
+        let marks = self.active_marks();
+        let mark_button =
+            |id: &'static str, glyph: &'static str, tip: &'static str, mark: Marks, cx: &mut Context<Self>| {
+                icon_button(id, glyph, tip, marks.contains(mark))
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle(mark, cx)))
+            };
+        let kind_button =
+            |id: &'static str, glyph: &'static str, tip: &'static str, kind: BlockKind, cx: &mut Context<Self>| {
+                icon_button(id, glyph, tip, block_kind == Some(kind))
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_block_kind(kind, cx)))
+            };
         div()
             .flex()
-            .flex_wrap()
             .items_center()
             .gap(px(2.))
-            .px(px(16.))
-            .py(px(6.))
+            .px(px(12.))
+            .h(px(44.))
             .border_t_1()
             .border_color(theme::border())
-            .child(tool_button("undo", "Undo", false).on_click(cx.listener(|this, _, w, cx| this.undo(&Undo, w, cx))))
-            .child(tool_button("redo", "Redo", false).on_click(cx.listener(|this, _, w, cx| this.redo(&Redo, w, cx))))
+            .child(
+                icon_button("undo", "undo-2", "Undo (⌘Z)", false)
+                    .on_click(cx.listener(|this, _, w, cx| this.undo(&Undo, w, cx))),
+            )
+            .child(
+                icon_button("redo", "redo-2", "Redo (⇧⌘Z)", false)
+                    .on_click(cx.listener(|this, _, w, cx| this.redo(&Redo, w, cx))),
+            )
             .child(separator())
-            .child(kind_button("h1", "Title", BlockKind::Heading(1), cx))
-            .child(kind_button("h2", "Heading", BlockKind::Heading(2), cx))
-            .child(kind_button("bullet", "• List", BlockKind::Bullet, cx))
-            .child(kind_button("numbered", "1. List", BlockKind::Numbered, cx))
-            .child(kind_button("quote", "Quote", BlockKind::Quote, cx))
+            .child(kind_button("h1", "heading-1", "Title", BlockKind::Heading(1), cx))
+            .child(kind_button("h2", "heading-2", "Heading", BlockKind::Heading(2), cx))
+            .child(kind_button("bullet", "list", "Bulleted list", BlockKind::Bullet, cx))
+            .child(kind_button("numbered", "list-ordered", "Numbered list", BlockKind::Numbered, cx))
+            .child(kind_button("quote", "text-quote", "Quote", BlockKind::Quote, cx))
             .child(separator())
-            .child(mark_button("bold", "B", Marks::BOLD, cx).font_weight(FontWeight::BOLD))
-            .child(mark_button("italic", "I", Marks::ITALIC, cx).italic())
-            .child(mark_button("underline", "U", Marks::UNDERLINE, cx).underline())
-            .child(mark_button("strike", "S", Marks::STRIKE, cx).line_through())
-            .child(mark_button("highlight", "Highlight", Marks::HIGHLIGHT, cx))
+            .child(mark_button("bold", "bold", "Bold (⌘B)", Marks::BOLD, cx))
+            .child(mark_button("italic", "italic", "Italic (⌘I)", Marks::ITALIC, cx))
+            .child(mark_button("underline", "underline", "Underline (⌘U)", Marks::UNDERLINE, cx))
+            .child(mark_button("strike", "strikethrough", "Strikethrough (⇧⌘X)", Marks::STRIKE, cx))
+            .child(mark_button("highlight", "highlighter", "Highlight (⇧⌘H)", Marks::HIGHLIGHT, cx))
             .child(div().flex_1())
             .child(
                 div()
-                    .px(px(6.))
-                    .text_size(px(13.))
+                    .px(px(8.))
+                    .text_size(px(12.))
                     .text_color(theme::muted())
-                    .child(format!("{} words", self.doc.word_count())),
+                    .child(format!("{} words", crate::home::group(self.doc.word_count() as i64))),
             )
     }
 
-    fn history_panel(&self, revisions: Vec<Revision>, cx: &mut Context<Self>) -> impl IntoElement {
+    fn history_panel(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let slide = self.history_slide.sample(window);
+        if slide <= 0.001 {
+            return None;
+        }
+        let revisions = self.history.clone().unwrap_or_default();
         let head = self.library.borrow().head(self.id).ok();
         let tz = jiff::tz::TimeZone::system();
-        div()
-            .id("history")
-            .w(px(280.))
-            .h_full()
-            .flex_none()
-            .flex()
-            .flex_col()
-            .overflow_y_scroll()
-            .bg(theme::surface())
-            .border_l_1()
-            .border_color(theme::border())
-            .child(
-                div()
-                    .px(px(16.))
-                    .py(px(12.))
-                    .text_size(px(12.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme::muted())
-                    .child("VERSION HISTORY"),
-            )
-            .children(revisions.into_iter().map(|rev| {
-                let current = Some(rev.id) == head;
-                let when = rev.created_at.to_zoned(tz.clone()).strftime("%b %-d, %-I:%M:%S %p").to_string();
-                let rev_id = rev.id;
+        let today = quill_store::today();
+        let mut rows: Vec<AnyElement> = Vec::new();
+        let mut last_day = None;
+        for (i, rev) in revisions.iter().enumerate() {
+            let when = rev.created_at.to_zoned(tz.clone());
+            let day = when.date();
+            if last_day != Some(day) {
+                last_day = Some(day);
+                let label = if day == today {
+                    "Today".to_string()
+                } else if today.yesterday().ok() == Some(day) {
+                    "Yesterday".to_string()
+                } else {
+                    day.strftime("%A, %B %-d").to_string()
+                };
+                rows.push(
+                    div()
+                        .px(px(18.))
+                        .pt(px(16.))
+                        .pb(px(6.))
+                        .text_size(px(11.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::muted())
+                        .child(label.to_uppercase())
+                        .into_any_element(),
+                );
+            }
+            let current = Some(rev.id) == head;
+            let change = revisions.get(i + 1).map(|older| rev.word_count - older.word_count);
+            let rev_id = rev.id;
+            rows.push(
                 div()
                     .id(("rev", rev.id as u64))
-                    .px(px(16.))
+                    .mx(px(8.))
+                    .px(px(10.))
                     .py(px(8.))
+                    .rounded(px(8.))
                     .flex()
-                    .flex_col()
+                    .items_center()
+                    .gap(px(10.))
                     .cursor_pointer()
                     .when(current, |d| d.bg(theme::selected_bg()))
-                    .hover(|s| s.bg(theme::raised()))
-                    .child(div().child(when))
-                    .child(div().text_size(px(12.)).text_color(theme::muted()).child(format!(
-                        "{} words{}",
-                        rev.word_count,
-                        if current { " · current" } else { "" }
-                    )))
+                    .when(!current, |d| d.hover(|s| s.bg(theme::raised())))
+                    .child(
+                        div()
+                            .size(px(8.))
+                            .rounded_full()
+                            .when(current, |d| d.bg(theme::accent()))
+                            .when(!current, |d| d.border_1().border_color(rgb(0x4a505c))),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(div().text_size(px(13.)).child(when.strftime("%-I:%M:%S %p").to_string()))
+                            .child(div().text_size(px(12.)).text_color(theme::muted()).child(match change {
+                                _ if current => format!("{} words · current", rev.word_count),
+                                Some(c) if c > 0 => format!("{} words · +{c}", rev.word_count),
+                                Some(c) if c < 0 => format!("{} words · {c}", rev.word_count),
+                                _ => format!("{} words", rev.word_count),
+                            })),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| this.checkout(rev_id, cx)))
-            }))
+                    .into_any_element(),
+            );
+        }
+        Some(
+            div()
+                .w(px(HISTORY_WIDTH * slide))
+                .h_full()
+                .flex_none()
+                .overflow_hidden()
+                .bg(theme::surface())
+                .border_l_1()
+                .border_color(theme::border())
+                .child(
+                    div()
+                        .id("history")
+                        .w(px(HISTORY_WIDTH))
+                        .h_full()
+                        .flex()
+                        .flex_col()
+                        .opacity(slide)
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .px(px(18.))
+                                .h(px(48.))
+                                .border_b_1()
+                                .border_color(theme::border())
+                                .child(div().flex_1().font_weight(FontWeight::SEMIBOLD).child("Version history"))
+                                .child(
+                                    icon_button("history-close", "x", "Close", false)
+                                        .on_click(cx.listener(|this, _, _, cx| this.toggle_history(cx))),
+                                ),
+                        )
+                        .child(
+                            div().px(px(18.)).py(px(10.)).text_size(px(12.)).text_color(theme::muted()).child(
+                                "Every change is kept. Click a version to restore it — later versions stay too.",
+                            ),
+                        )
+                        .child(div().id("history-list").flex_1().overflow_y_scroll().pb(px(16.)).children(rows)),
+                )
+                .into_any_element(),
+        )
     }
 
     fn media_card(&self, compact: bool, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let now = self.media.read(cx).now.clone()?;
         let artwork = self.media.read(cx).artwork();
-        let control = |id: &'static str, label: &'static str, control: Control, media: Entity<Media>| {
+        let control = |id: &'static str, glyph: &'static str, size: f32, control: Control, media: Entity<Media>| {
             div()
                 .id(id)
-                .size(px(34.))
+                .size(px(32.))
                 .flex()
                 .items_center()
                 .justify_center()
                 .rounded_full()
                 .cursor_pointer()
                 .hover(|s| s.bg(theme::raised()))
-                .child(label)
+                .child(icon(glyph).size(px(size)).text_color(theme::text()))
                 .on_click(move |_, _, cx| media.update(cx, |m, cx| m.control(control, cx)))
         };
         let media = self.media.clone();
+        let play = if now.playing { "pause" } else { "play" };
         Some(
             div()
                 .flex()
                 .items_center()
                 .gap(px(10.))
                 .p(px(8.))
-                .rounded(px(14.))
-                .bg(theme::surface())
+                .pr(px(10.))
+                .rounded(px(16.))
+                .bg(rgba(0x1d2027f2))
                 .border_1()
                 .border_color(theme::border())
-                .shadow_lg()
+                .shadow(floating_shadow())
                 .when(!compact, |d| {
                     d.child(match artwork {
                         Some(image) => img(image).size(px(44.)).rounded(px(8.)).into_any_element(),
-                        None => div().size(px(44.)).rounded(px(8.)).bg(theme::selected_bg()).into_any_element(),
+                        None => div()
+                            .size(px(44.))
+                            .rounded(px(8.))
+                            .bg(theme::selected_bg())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(icon("music").size(px(18.)).text_color(rgb(0x9db4f5)))
+                            .into_any_element(),
                     })
-                })
-                .when(!compact, |d| {
-                    d.child(
+                    .child(
                         div()
-                            .w(px(160.))
+                            .w(px(150.))
                             .flex()
                             .flex_col()
                             .overflow_hidden()
@@ -757,40 +958,42 @@ impl EditorView {
                                     .text_ellipsis()
                                     .child(now.artist.clone()),
                             )
-                            .child(
-                                div()
-                                    .mt(px(6.))
-                                    .h(px(3.))
-                                    .rounded(px(2.))
-                                    .bg(theme::border())
-                                    .child(div().h_full().w(relative(now.progress)).bg(theme::text())),
-                            ),
+                            .child(div().mt(px(7.)).h(px(3.)).rounded(px(2.)).bg(theme::border()).child(
+                                div().h_full().rounded(px(2.)).w(relative(now.progress)).bg(theme::text_soft()),
+                            )),
                     )
                 })
                 .when(compact, |d| {
                     d.child(
                         div()
-                            .max_w(px(220.))
+                            .max_w(px(240.))
                             .text_size(px(13.))
                             .text_color(theme::muted())
                             .text_ellipsis()
                             .child(format!("{} · {}", now.title, now.artist)),
                     )
                 })
-                .when(!compact, |d| d.child(control("prev", "⏮", Control::Previous, media.clone())))
-                .child(control("playpause", if now.playing { "⏸" } else { "▶" }, Control::PlayPause, media.clone()))
-                .child(control("next", "⏭", Control::Next, media)),
+                .when(!compact, |d| d.child(control("prev", "skip-back", 15., Control::Previous, media.clone())))
+                .child(control("playpause", play, 16., Control::PlayPause, media.clone()))
+                .child(control("next", "skip-forward", 15., Control::Next, media)),
         )
     }
 
     fn page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let focus = self.mode == Mode::Focus;
+        let z = self.zoom.value();
         div()
-            .w(px(TEXT_WIDTH + PAGE_PADDING.0 * 2.))
-            .min_h(px(900.))
-            .px(px(PAGE_PADDING.0))
-            .py(px(PAGE_PADDING.1))
-            .when(!focus, |d| d.bg(theme::surface()).rounded(px(4.)).shadow_lg())
+            .w(px((TEXT_WIDTH + PAGE_PADDING.0 * 2.) * z))
+            .min_h(px(PAGE_MIN_HEIGHT * z))
+            .px(px(PAGE_PADDING.0 * z))
+            .py(px(PAGE_PADDING.1 * z))
+            .when(!focus, |d| {
+                d.bg(theme::page())
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(rgb(0x2c303a))
+                    .shadow(page_shadow(self.mode == Mode::Board))
+            })
             .cursor(CursorStyle::IBeam)
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
@@ -799,36 +1002,38 @@ impl EditorView {
             .child(PageElement { editor: cx.entity() })
     }
 
-    /// How big the board must be to hold the page and every item.
+    /// How big the board must be (at the current zoom) to hold the page and
+    /// every item.
     fn board_extent(&self) -> (f32, f32) {
-        let page_h = self.layout.as_ref().map_or(900., |l| f32::from(l.height)).max(900. - PAGE_PADDING.1 * 2.)
-            + PAGE_PADDING.1 * 2.;
+        let z = self.zoom.value();
+        let text_h = self.layout.as_ref().map_or(0., |l| f32::from(l.height) / z.max(0.01));
+        let page_h = PAGE_MIN_HEIGHT.max(text_h + PAGE_PADDING.1 * 2.);
         let mut half_w = TEXT_WIDTH / 2. + PAGE_PADDING.0;
         let mut bottom = page_h;
         for item in &self.board {
             half_w = half_w.max(item.x.abs()).max((item.x + item.w).abs());
             bottom = bottom.max(item.y + item.h);
         }
-        (half_w * 2. + 160., bottom + PAGE_TOP + 240.)
+        ((half_w * 2. + 160.) * z, (bottom + 240.) * z + PAGE_TOP)
     }
 
-    fn render_focus(&mut self, cx: &mut Context<Self>) -> Div {
+    fn render_focus(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let written = self.doc.word_count().saturating_sub(self.session_start_words);
         div()
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(0x15171c))
+            .bg(rgb(0x121419))
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .px(px(24.))
-                    .py(px(14.))
+                    .px(px(20.))
+                    .h(px(52.))
                     .child(div().text_size(px(13.)).text_color(theme::muted()).child(self.doc.title.clone()))
                     .child(div().flex_1())
                     .child(
-                        tool_button("exit-focus", "Exit", false)
+                        icon_button("exit-focus", "x", "Exit focus (Esc)", false)
                             .on_click(cx.listener(|this, _, window, cx| this.set_mode(Mode::Page, window, cx))),
                     ),
             )
@@ -837,47 +1042,104 @@ impl EditorView {
                     .id("focus-scroll")
                     .flex_1()
                     .overflow_y_scroll()
-                    .child(div().flex().justify_center().py(px(48.)).child(self.page(cx))),
+                    .child(div().flex().justify_center().pt(px(40.)).pb(px(160.)).child(self.page(cx))),
             )
             .child(
                 div()
                     .flex()
-                    .flex_wrap()
                     .justify_center()
                     .items_center()
-                    .gap(px(28.))
-                    .px(px(24.))
-                    .py(px(12.))
+                    .gap(px(24.))
+                    .h(px(64.))
                     .text_size(px(13.))
                     .text_color(theme::muted())
-                    .child(format!("{} words this session", written))
+                    .child(format!("{} words this session", crate::home::group(written as i64)))
                     .children(self.media_card(true, cx)),
             )
+            .with_animation("focus-enter", Animation::new(anim::STANDARD).with_easing(anim::ease_out), |el, t| {
+                el.opacity(t)
+            })
     }
 }
 
-fn tool_button(id: &'static str, label: &'static str, active: bool) -> Stateful<Div> {
+pub(crate) fn icon_button(id: &'static str, glyph: &'static str, tip: &'static str, active: bool) -> Stateful<Div> {
     div()
         .id(id)
-        .min_w(px(36.))
-        .h(px(32.))
-        .px(px(10.))
+        .size(px(32.))
         .flex()
         .items_center()
         .justify_center()
-        .rounded(px(6.))
+        .rounded(px(7.))
         .cursor_pointer()
         .when(active, |d| d.bg(theme::selected_bg()))
-        .hover(|s| s.bg(theme::raised()))
-        .child(label)
+        .when(!active, |d| d.hover(|s| s.bg(theme::raised())))
+        .child(icon(glyph).size(px(17.)).text_color(if active { theme::accent() } else { theme::text_soft() }))
+        .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
 }
 
 fn separator() -> Div {
-    div().w(px(1.)).h(px(22.)).mx(px(6.)).bg(theme::border())
+    div().w(px(1.)).h(px(20.)).mx(px(6.)).bg(theme::border())
+}
+
+pub(crate) fn floating_shadow() -> Vec<BoxShadow> {
+    vec![
+        BoxShadow {
+            color: hsla(0., 0., 0., 0.35),
+            offset: point(px(0.), px(10.)),
+            blur_radius: px(30.),
+            spread_radius: px(0.),
+            inset: false,
+        },
+        BoxShadow {
+            color: hsla(0., 0., 0., 0.25),
+            offset: point(px(0.), px(1.)),
+            blur_radius: px(3.),
+            spread_radius: px(0.),
+            inset: false,
+        },
+    ]
+}
+
+fn page_shadow(lifted: bool) -> Vec<BoxShadow> {
+    let (y, blur, alpha) = if lifted { (18., 48., 0.5) } else { (8., 28., 0.4) };
+    vec![BoxShadow {
+        color: hsla(0., 0., 0., alpha),
+        offset: point(px(0.), px(y)),
+        blur_radius: px(blur),
+        spread_radius: px(0.),
+        inset: false,
+    }]
+}
+
+/// The board's dot grid, painted across the whole board.
+fn dot_grid(zoom: f32, opacity: f32) -> impl IntoElement {
+    canvas(
+        |_, _, _| {},
+        move |bounds, _, window, _| {
+            let step = px(DOT_SPACING * zoom);
+            let dot = px(1.6 * zoom.max(0.6));
+            let color = hsla(220. / 360., 0.12, 0.32, opacity);
+            let mut y = bounds.top() + step / 2.;
+            while y < bounds.bottom() {
+                let mut x = bounds.left() + step / 2.;
+                while x < bounds.right() {
+                    window.paint_quad(fill(Bounds::new(point(x, y), size(dot, dot)), color).corner_radii(dot / 2.));
+                    x += step;
+                }
+                y += step;
+            }
+        },
+    )
+    .absolute()
+    .size_full()
 }
 
 impl Render for EditorView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Keep frames coming while anything is mid-animation.
+        let zoom = self.zoom.sample(window);
+        let board_fade = self.board_fade.sample(window);
+
         let root = div()
             .size_full()
             .flex()
@@ -925,14 +1187,20 @@ impl Render for EditorView {
             .on_action(cx.listener(|this, _: &ToggleFocus, window, cx| {
                 let next = if this.mode == Mode::Focus { Mode::Page } else { Mode::Focus };
                 this.set_mode(next, window, cx);
-            }));
+            }))
+            .on_action(cx.listener(|this, _: &ToggleBoard, window, cx| {
+                let next = if this.mode == Mode::Board { Mode::Page } else { Mode::Board };
+                this.set_mode(next, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleHistory, _, cx| this.toggle_history(cx)));
 
         if self.mode == Mode::Focus {
-            return root.child(self.render_focus(cx));
+            return root.child(self.render_focus(cx)).into_any_element();
         }
 
         let (board_w, board_h) = self.board_extent();
-        let history = self.history.clone();
+        let history = self.history_panel(window, cx);
+        let tools_lift = 1. - (zoom - BOARD_ZOOM) / (1. - BOARD_ZOOM);
         root.child(
             div()
                 .flex()
@@ -952,6 +1220,7 @@ impl Render for EditorView {
                     div()
                         .relative()
                         .flex_1()
+                        .min_w_0()
                         .h_full()
                         .child(
                             div().id("board-scroll").size_full().overflow_scroll().child(
@@ -967,27 +1236,29 @@ impl Render for EditorView {
                                     .on_mouse_down(MouseButton::Left, cx.listener(Self::board_mouse_down))
                                     .on_mouse_move(cx.listener(Self::board_mouse_move))
                                     .on_mouse_up(MouseButton::Left, cx.listener(Self::board_mouse_up))
+                                    .child(dot_grid(zoom, 0.35 + 0.65 * board_fade))
                                     .child(div().flex().justify_center().pt(px(PAGE_TOP)).child(self.page(cx)))
-                                    .child(self.render_board(cx)),
+                                    .child(self.render_board(board_fade, cx)),
                             ),
                         )
                         .child(
                             div()
                                 .absolute()
-                                .bottom(px(20.))
+                                .bottom(px(18. + 6. * tools_lift))
                                 .left_0()
                                 .right_0()
                                 .flex()
                                 .justify_center()
-                                .child(self.tool_bar(cx)),
+                                .child(self.tool_bar(0.82 + 0.18 * tools_lift, cx)),
                         )
                         .children(
                             self.media_card(false, cx)
-                                .map(|card| div().absolute().right(px(16.)).bottom(px(20.)).child(card)),
+                                .map(|card| div().absolute().right(px(16.)).bottom(px(18.)).child(card)),
                         ),
                 )
-                .children(history.map(|revs| self.history_panel(revs, cx))),
+                .children(history),
         )
+        .into_any_element()
     }
 }
 
