@@ -42,6 +42,10 @@ const BOARD_DIMMED: f32 = 0.3;
 const HISTORY_WIDTH: f32 = 300.;
 const HISTORY_SHOWN: usize = 400;
 const DOT_SPACING: f32 = 24.;
+const MIN_ZOOM: f32 = 0.3;
+const MAX_ZOOM: f32 = 2.5;
+/// Stops for ⌘= / ⌘− and the toolbar's zoom buttons.
+const ZOOM_STEPS: [f32; 10] = [0.3, 0.5, 0.67, 0.78, 0.9, 1.0, 1.25, 1.5, 2.0, 2.5];
 
 actions!(
     editor,
@@ -77,6 +81,9 @@ actions!(
         ToggleFocus,
         ToggleBoard,
         ToggleHistory,
+        ZoomIn,
+        ZoomOut,
+        ZoomReset,
     ]
 );
 
@@ -116,6 +123,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-f", ToggleFocus, ctx),
         KeyBinding::new("cmd-shift-b", ToggleBoard, ctx),
         KeyBinding::new("cmd-shift-y", ToggleHistory, ctx),
+        KeyBinding::new("cmd-=", ZoomIn, ctx),
+        KeyBinding::new("cmd-+", ZoomIn, ctx),
+        KeyBinding::new("cmd--", ZoomOut, ctx),
+        KeyBinding::new("cmd-0", ZoomReset, ctx),
     ]);
 }
 
@@ -159,6 +170,9 @@ pub struct EditorView {
 
     pub mode: Mode,
     pub(crate) zoom: Tween,
+    /// The zoom Board mode returns to; pinching changes it.
+    board_zoom: f32,
+    scroll: ScrollHandle,
     pub(crate) board_fade: Tween,
     history_slide: Tween,
     pub(crate) board: Vec<BoardItem>,
@@ -232,6 +246,8 @@ impl EditorView {
             _blink: blink,
             mode: Mode::Page,
             zoom: Tween::new(1.),
+            board_zoom: BOARD_ZOOM,
+            scroll: ScrollHandle::new(),
             board_fade: Tween::new(BOARD_DIMMED),
             history_slide: Tween::new(0.),
             board: Vec::new(),
@@ -280,7 +296,7 @@ impl EditorView {
         }
         self.mode = mode;
         let (zoom, fade) = match mode {
-            Mode::Board => (BOARD_ZOOM, 1.),
+            Mode::Board => (self.board_zoom, 1.),
             Mode::Page | Mode::Focus => (1., BOARD_DIMMED),
         };
         self.zoom.set(zoom, anim::STANDARD);
@@ -288,6 +304,59 @@ impl EditorView {
         self.touch();
         window.focus(&self.focus_handle, cx);
         cx.notify();
+    }
+
+    /// Zooms the canvas to `z`, keeping the board point under `anchor`
+    /// (window coordinates) in place. Zooming the page out far enough moves
+    /// to the board, the way pinching out of a document does in Freeform.
+    pub(crate) fn zoom_to(&mut self, z: f32, anchor: Option<Point<Pixels>>, animate: bool, cx: &mut Context<Self>) {
+        let z = z.clamp(MIN_ZOOM, MAX_ZOOM);
+        let old = self.zoom.value();
+        if self.mode == Mode::Focus {
+            return;
+        }
+        if self.mode == Mode::Page && z < 0.97 {
+            self.commit();
+            self.mode = Mode::Board;
+            self.board_fade.set(1., anim::STANDARD);
+        }
+        if self.mode == Mode::Board {
+            self.board_zoom = z;
+        }
+        if let Some(anchor) = anchor {
+            let b = anchor - self.board_origin;
+            let (bx, by) = (f32::from(b.x) / old.max(0.01), f32::from(b.y) / old.max(0.01));
+            let offset = self.scroll.offset();
+            self.scroll.set_offset(point(offset.x - px(bx * (z - old)), offset.y - px(by * (z - old))));
+        }
+        self.zoom.set(z, if animate { anim::QUICK } else { Duration::ZERO });
+        cx.notify();
+    }
+
+    pub(crate) fn zoom_step(&mut self, up: bool, cx: &mut Context<Self>) {
+        let current = self.zoom.target();
+        let next = if up {
+            ZOOM_STEPS.iter().copied().find(|s| *s > current + 0.01).unwrap_or(MAX_ZOOM)
+        } else {
+            ZOOM_STEPS.iter().rev().copied().find(|s| *s < current - 0.01).unwrap_or(MIN_ZOOM)
+        };
+        self.zoom_to(next, None, true, cx);
+    }
+
+    fn on_pinch(&mut self, event: &PinchEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let z = self.zoom.target() * (1. + event.delta);
+        self.zoom_to(z, Some(event.position), false, cx);
+    }
+
+    /// ⌘ or Ctrl + scroll zooms, like Maps and Freeform.
+    fn on_scroll_wheel(&mut self, event: &ScrollEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if !(event.modifiers.platform || event.modifiers.control) {
+            return;
+        }
+        cx.stop_propagation();
+        let dy = f32::from(event.delta.pixel_delta(px(16.)).y);
+        let z = self.zoom.target() * (1. + dy * 0.01).clamp(0.5, 1.5);
+        self.zoom_to(z, Some(event.position), false, cx);
     }
 
     /// Writes the current edit group to the permanent history.
@@ -1192,7 +1261,10 @@ impl Render for EditorView {
                 let next = if this.mode == Mode::Board { Mode::Page } else { Mode::Board };
                 this.set_mode(next, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &ToggleHistory, _, cx| this.toggle_history(cx)));
+            .on_action(cx.listener(|this, _: &ToggleHistory, _, cx| this.toggle_history(cx)))
+            .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.zoom_step(true, cx)))
+            .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.zoom_step(false, cx)))
+            .on_action(cx.listener(|this, _: &ZoomReset, _, cx| this.zoom_to(1., None, true, cx)));
 
         if self.mode == Mode::Focus {
             return root.child(self.render_focus(cx)).into_any_element();
@@ -1223,7 +1295,7 @@ impl Render for EditorView {
                         .min_w_0()
                         .h_full()
                         .child(
-                            div().id("board-scroll").size_full().overflow_scroll().child(
+                            div().id("board-scroll").size_full().overflow_scroll().track_scroll(&self.scroll).child(
                                 div()
                                     .id("board")
                                     .relative()
@@ -1236,6 +1308,8 @@ impl Render for EditorView {
                                     .on_mouse_down(MouseButton::Left, cx.listener(Self::board_mouse_down))
                                     .on_mouse_move(cx.listener(Self::board_mouse_move))
                                     .on_mouse_up(MouseButton::Left, cx.listener(Self::board_mouse_up))
+                                    .on_pinch(cx.listener(Self::on_pinch))
+                                    .on_scroll(cx.listener(Self::on_scroll_wheel))
                                     .child(dot_grid(zoom, 0.35 + 0.65 * board_fade))
                                     .child(div().flex().justify_center().pt(px(PAGE_TOP)).child(self.page(cx)))
                                     .child(self.render_board(board_fade, cx)),

@@ -26,7 +26,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Test
-        run: cargo test --workspace --exclude quill
+        run: |
+          cargo test --workspace
+          cargo test -p quill --features screenshots --test whiteboard
 
       - name: Build and bundle
         id: bundle

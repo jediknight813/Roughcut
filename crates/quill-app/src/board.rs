@@ -102,6 +102,9 @@ impl EditorView {
         if self.mode != Mode::Board {
             return;
         }
+        // The board manages focus itself; stop the editor's container from
+        // grabbing it afterwards (which would steal it from a new note).
+        window.prevent_default();
         window.focus(&self.focus_handle, cx);
         self.stop_editing_item(cx);
         self.selected_item = None;
@@ -115,12 +118,14 @@ impl EditorView {
                 let (w, h) = STICKY_SIZE;
                 let kind = ItemKind::Sticky { text: String::new(), color: self.note_color };
                 if let Some(id) = self.add_item(f32::from(p.x) - w / 2., f32::from(p.y) - 20., w, h, kind) {
+                    self.tool = Tool::Select;
                     self.edit_item(id, window, cx);
                 }
             }
             Tool::Text => {
                 let kind = ItemKind::Text { text: String::new() };
                 if let Some(id) = self.add_item(f32::from(p.x), f32::from(p.y) - 12., 260., 60., kind) {
+                    self.tool = Tool::Select;
                     self.edit_item(id, window, cx);
                 }
             }
@@ -209,6 +214,11 @@ impl EditorView {
             }
             Tool::Select | Tool::Sticky | Tool::Text | Tool::Shape | Tool::Image => {
                 cx.stop_propagation();
+                if self.editing.as_ref().is_some_and(|e| e.id == id) {
+                    // Clicks inside the note being edited belong to its text box.
+                    return;
+                }
+                window.prevent_default();
                 window.focus(&self.focus_handle, cx);
                 let editable = self
                     .board
@@ -368,6 +378,14 @@ impl EditorView {
         cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(paths))) = paths.await else { return };
             let Some(path) = paths.into_iter().next() else { return };
+            this.update(cx, |this, cx| this.insert_image_from(&path, at, cx)).ok();
+        })
+        .detach();
+    }
+
+    /// Adds the image at `path` to the board, centred on `at` (board coordinates).
+    pub fn insert_image_from(&mut self, path: &std::path::Path, at: Point<Pixels>, cx: &mut Context<Self>) {
+        {
             let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
             let mime = match ext.as_str() {
                 "png" => "image/png",
@@ -376,25 +394,21 @@ impl EditorView {
                 "webp" => "image/webp",
                 _ => return,
             };
-            let Ok(bytes) = std::fs::read(&path) else { return };
+            let Ok(bytes) = std::fs::read(path) else { return };
             let (w, h) = image_size(&bytes).unwrap_or((240, 180));
             let scale = (280. / w as f32).min(1.);
-            this.update(cx, |this, cx| {
-                let asset = match this.library.borrow_mut().add_asset(mime, &bytes) {
-                    Ok(asset) => asset,
-                    Err(err) => {
-                        eprintln!("quill: storing the image failed: {err}");
-                        return;
-                    }
-                };
-                let (w, h) = (w as f32 * scale, h as f32 * scale);
-                this.add_item(f32::from(at.x) - w / 2., f32::from(at.y) - h / 2., w, h, ItemKind::Image { asset });
-                this.tool = Tool::Select;
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+            let asset = match self.library.borrow_mut().add_asset(mime, &bytes) {
+                Ok(asset) => asset,
+                Err(err) => {
+                    eprintln!("quill: storing the image failed: {err}");
+                    return;
+                }
+            };
+            let (w, h) = (w as f32 * scale, h as f32 * scale);
+            self.add_item(f32::from(at.x) - w / 2., f32::from(at.y) - h / 2., w, h, ItemKind::Image { asset });
+            self.tool = Tool::Select;
+            cx.notify();
+        }
     }
 
     fn image(&mut self, asset: quill_store::AssetId) -> Option<Arc<Image>> {
@@ -641,6 +655,88 @@ impl EditorView {
                         cx.notify();
                     }))
             }))
+            .child(div().w(px(1.)).h(px(24.)).mx(px(6.)).bg(theme::border()))
+            .child(
+                div()
+                    .id("zoom-out")
+                    .size(px(30.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(8.))
+                    .cursor_pointer()
+                    .text_size(px(17.))
+                    .text_color(theme::text_soft())
+                    .hover(|s| s.bg(theme::raised()))
+                    .child("−")
+                    .tooltip(|window, cx| Tooltip::new("Zoom out (⌘−)").build(window, cx))
+                    .on_click(cx.listener(|this, _, _, cx| this.zoom_step(false, cx))),
+            )
+            .child(
+                div()
+                    .id("zoom-reset")
+                    .w(px(46.))
+                    .h(px(30.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(8.))
+                    .cursor_pointer()
+                    .text_size(px(12.))
+                    .text_color(theme::text_soft())
+                    .hover(|s| s.bg(theme::raised()))
+                    .child(format!("{}%", (self.zoom.target() * 100.).round() as i32))
+                    .tooltip(|window, cx| Tooltip::new("Actual size (⌘0)").build(window, cx))
+                    .on_click(cx.listener(|this, _, _, cx| this.zoom_to(1., None, true, cx))),
+            )
+            .child(
+                div()
+                    .id("zoom-in")
+                    .size(px(30.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(8.))
+                    .cursor_pointer()
+                    .text_size(px(17.))
+                    .text_color(theme::text_soft())
+                    .hover(|s| s.bg(theme::raised()))
+                    .child("+")
+                    .tooltip(|window, cx| Tooltip::new("Zoom in (⌘=)").build(window, cx))
+                    .on_click(cx.listener(|this, _, _, cx| this.zoom_step(true, cx))),
+            )
+    }
+}
+
+/// Read-only access and tool selection for integration tests, which drive
+/// the board with real mouse and keyboard events.
+#[doc(hidden)]
+impl EditorView {
+    pub fn board_items(&self) -> &[BoardItem] {
+        &self.board
+    }
+
+    pub fn editing_item(&self) -> Option<ItemId> {
+        self.editing.as_ref().map(|e| e.id)
+    }
+
+    pub fn selected(&self) -> Option<ItemId> {
+        self.selected_item
+    }
+
+    pub fn set_tool(&mut self, tool: Tool, cx: &mut Context<Self>) {
+        self.tool = tool;
+        cx.notify();
+    }
+
+    /// Where a board point is on screen, as of the last frame.
+    pub fn board_to_window(&self, x: f32, y: f32) -> Point<Pixels> {
+        let z = self.zoom.value();
+        self.board_origin + point(px(x * z), px(y * z))
+    }
+
+    pub fn zoom_level(&self) -> f32 {
+        self.zoom.value()
     }
 }
 

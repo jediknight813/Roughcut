@@ -5,12 +5,13 @@ edition = "2024"
 
 [features]
 # Offscreen screenshot tour for design review (see src/tour.rs).
-screenshots = ["dep:image", "dep:gpui-pre", "dep:gpui-pre-macos", "gpui-pre/test-support", "gpui-pre-macos/test-support"]
+screenshots = ["dep:image", "dep:gpui-pre", "dep:gpui-pre-macos", "dep:gpui-pre-platform", "gpui-pre/test-support", "gpui-pre-macos/test-support", "gpui-pre-platform/test-support"]
 
 [dependencies]
 # Only to switch on offscreen rendering for the screenshot tour; versions match gpui-kit's.
 gpui-pre = { version = "=0.3.11", optional = true, default-features = false }
 gpui-pre-macos = { version = "=0.3.11", optional = true, default-features = false }
+gpui-pre-platform = { version = "=0.3.11", optional = true, default-features = false }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 directories = "6.0.0"
 gpui-kit = "0.9.0"
@@ -19,3 +20,11 @@ quill-doc = { version = "0.1.0", path = "../quill-doc" }
 quill-import = { version = "0.1.0", path = "../quill-import" }
 quill-store = { version = "0.1.0", path = "../quill-store" }
 ureq = { version = "3.5.1", default-features = false, features = ["rustls"] }
+
+# Drives the real editor offscreen with simulated mouse and keyboard input.
+# Run: cargo test -p quill --features screenshots --test whiteboard
+[[test]]
+name = "whiteboard"
+path = "tests/whiteboard.rs"
+harness = false
+required-features = ["screenshots"]

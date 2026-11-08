@@ -68,6 +68,11 @@ impl Media {
         Media { now: None, art: HashMap::new(), _poll: poll }
     }
 
+    /// A player that never polls Spotify (for tests and previews).
+    pub fn idle() -> Media {
+        Media { now: None, art: HashMap::new(), _poll: Task::ready(()) }
+    }
+
     /// The current track's cover, once fetched.
     pub fn artwork(&self) -> Option<Arc<Image>> {
         let url = self.now.as_ref()?.artwork_url.as_ref()?;
