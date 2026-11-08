@@ -10,7 +10,7 @@
 //! paragraph except the current one.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -20,6 +20,7 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use quill_doc::{BlockKind, Document, Marks, Pos};
+use quill_spell::Speller;
 use quill_store::{AssetId, BoardItem, DocId, ItemId, Library, Revision};
 
 use crate::anim::{self, Tween};
@@ -42,6 +43,10 @@ const BOARD_DIMMED: f32 = 0.3;
 const HISTORY_WIDTH: f32 = 300.;
 const HISTORY_SHOWN: usize = 400;
 const DOT_SPACING: f32 = 24.;
+/// Spelling menu geometry, shared with tests that click its rows.
+pub const MENU_WIDTH: f32 = 220.;
+pub const MENU_PADDING: f32 = 6.;
+pub const MENU_ROW: f32 = 30.;
 const MIN_ZOOM: f32 = 0.3;
 const MAX_ZOOM: f32 = 2.5;
 /// Stops for ⌘= / ⌘− and the toolbar's zoom buttons.
@@ -81,6 +86,7 @@ actions!(
         ToggleFocus,
         ToggleBoard,
         ToggleHistory,
+        ToggleSpelling,
         ZoomIn,
         ZoomOut,
         ZoomReset,
@@ -127,6 +133,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-+", ZoomIn, ctx),
         KeyBinding::new("cmd--", ZoomOut, ctx),
         KeyBinding::new("cmd-0", ZoomReset, ctx),
+        KeyBinding::new("cmd-alt-l", ToggleSpelling, ctx),
     ]);
 }
 
@@ -142,6 +149,15 @@ pub enum Mode {
     Board,
     Page,
     Focus,
+}
+
+/// The right-click menu on a misspelled word.
+struct SpellMenu {
+    block: usize,
+    range: Range<usize>,
+    word: String,
+    suggestions: Vec<String>,
+    at: Point<Pixels>,
 }
 
 pub enum EditorEvent {
@@ -186,6 +202,14 @@ pub struct EditorView {
     pub(crate) removed_items: Vec<ItemId>,
     pub(crate) images: HashMap<AssetId, Arc<Image>>,
 
+    speller: Rc<RefCell<Speller>>,
+    pub spellcheck: bool,
+    /// Misspelled ranges by block text, so unchanged paragraphs aren't rechecked.
+    spell_cache: RefCell<HashMap<String, Vec<Range<usize>>>>,
+    /// Words ignored for this session ("Ignore Spelling"), lowercased.
+    ignored: HashSet<String>,
+    spell_menu: Option<SpellMenu>,
+
     media: Entity<Media>,
     history: Option<Vec<Revision>>,
     session_start_words: usize,
@@ -206,6 +230,7 @@ impl EditorView {
         id: DocId,
         doc: Document,
         media: Entity<Media>,
+        speller: Rc<RefCell<Speller>>,
         cx: &mut Context<Self>,
     ) -> EditorView {
         let end = doc.end();
@@ -259,6 +284,11 @@ impl EditorView {
             editing: None,
             removed_items: Vec::new(),
             images: HashMap::new(),
+            speller,
+            spellcheck: true,
+            spell_cache: RefCell::default(),
+            ignored: HashSet::new(),
+            spell_menu: None,
             media,
             history: None,
             session_start_words,
@@ -280,6 +310,180 @@ impl EditorView {
 
     pub fn dim_except(&self) -> Option<usize> {
         (self.mode == Mode::Focus && self.anchor == self.head).then_some(self.head.block)
+    }
+
+    /// Misspelled byte ranges for each block. The word being typed isn't
+    /// flagged until the caret leaves it, so words aren't marked mid-way.
+    pub fn misspellings(&self) -> Vec<Vec<Range<usize>>> {
+        if !self.spellcheck {
+            return Vec::new();
+        }
+        let speller = self.speller.borrow();
+        let mut cache = self.spell_cache.borrow_mut();
+        if cache.len() > 4000 {
+            cache.clear();
+        }
+        let typing = self.pending == Some(EditKind::Typing) && self.anchor == self.head;
+        self.doc
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(i, block)| {
+                let text = block.text();
+                let ranges = cache
+                    .entry(text.clone())
+                    .or_insert_with(|| {
+                        speller
+                            .misspellings(&text)
+                            .into_iter()
+                            .filter(|r| !self.ignored.contains(&text[r.clone()].to_lowercase()))
+                            .collect()
+                    })
+                    .clone();
+                ranges
+                    .into_iter()
+                    .filter(|r| {
+                        !(typing && i == self.head.block && r.start <= self.head.offset && self.head.offset <= r.end)
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn on_right_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        cx.stop_propagation();
+        self.spell_menu = None;
+        if self.mode == Mode::Board {
+            return;
+        }
+        window.focus(&self.focus_handle, cx);
+        let Some(layout) = &self.layout else { return };
+        let pos = layout.pos_for_point(event.position);
+        let hit = self
+            .misspellings()
+            .get(pos.block)
+            .and_then(|ranges| ranges.iter().find(|r| r.start <= pos.offset && pos.offset <= r.end).cloned());
+        if let Some(range) = hit {
+            let word = self.doc.blocks[pos.block].text()[range.clone()].to_string();
+            let suggestions = self.speller.borrow().suggestions(&word);
+            self.anchor = Pos::new(pos.block, range.start);
+            self.head = Pos::new(pos.block, range.end);
+            self.spell_menu = Some(SpellMenu { block: pos.block, range, word, suggestions, at: event.position });
+        }
+        cx.notify();
+    }
+
+    fn apply_suggestion(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(menu) = self.spell_menu.take() else { return };
+        let Some(word) = menu.suggestions.get(index).cloned() else { return };
+        self.commit();
+        self.anchor = Pos::new(menu.block, menu.range.start);
+        self.head = Pos::new(menu.block, menu.range.end);
+        self.replace_selection(&word, EditKind::Other, cx);
+    }
+
+    fn learn_spelling(&mut self, cx: &mut Context<Self>) {
+        let Some(menu) = self.spell_menu.take() else { return };
+        self.speller.borrow_mut().learn(&menu.word);
+        if let Err(err) = self.library.borrow_mut().learn_word(&menu.word) {
+            eprintln!("quill: saving a learned word failed: {err}");
+        }
+        self.spell_cache.borrow_mut().clear();
+        cx.notify();
+    }
+
+    fn ignore_spelling(&mut self, cx: &mut Context<Self>) {
+        let Some(menu) = self.spell_menu.take() else { return };
+        self.ignored.insert(menu.word.to_lowercase());
+        self.spell_cache.borrow_mut().clear();
+        cx.notify();
+    }
+
+    fn toggle_spelling(&mut self, cx: &mut Context<Self>) {
+        self.spellcheck = !self.spellcheck;
+        self.spell_menu = None;
+        cx.notify();
+    }
+
+    fn spell_menu_element(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let menu = self.spell_menu.as_ref()?;
+        let row = |id: (&'static str, usize), label: String, bold: bool| {
+            div()
+                .id(id)
+                .h(px(MENU_ROW))
+                .px(px(10.))
+                .flex()
+                .items_center()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .text_size(px(13.))
+                .when(bold, |d| d.font_weight(FontWeight::SEMIBOLD))
+                .hover(|s| s.bg(theme::accent()).text_color(theme::on_accent()))
+                .child(label)
+        };
+        let mut rows: Vec<AnyElement> = menu
+            .suggestions
+            .iter()
+            .enumerate()
+            .map(|(i, word)| {
+                row(("suggestion", i), word.clone(), true)
+                    .on_click(cx.listener(move |this, _, _, cx| this.apply_suggestion(i, cx)))
+                    .into_any_element()
+            })
+            .collect();
+        if rows.is_empty() {
+            rows.push(
+                div()
+                    .h(px(MENU_ROW))
+                    .px(px(10.))
+                    .flex()
+                    .items_center()
+                    .text_size(px(13.))
+                    .text_color(theme::muted())
+                    .child("No guesses found")
+                    .into_any_element(),
+            );
+        }
+        rows.push(div().h(px(1.)).my(px(4.)).bg(theme::border()).into_any_element());
+        rows.push(
+            row(("spell-learn", 0), "Learn Spelling".into(), false)
+                .on_click(cx.listener(|this, _, _, cx| this.learn_spelling(cx)))
+                .into_any_element(),
+        );
+        rows.push(
+            row(("spell-ignore", 0), "Ignore Spelling".into(), false)
+                .on_click(cx.listener(|this, _, _, cx| this.ignore_spelling(cx)))
+                .into_any_element(),
+        );
+        Some(
+            deferred(
+                anchored().position(menu.at).snap_to_window().child(
+                    div()
+                        .id("spell-menu")
+                        .w(px(MENU_WIDTH))
+                        .p(px(MENU_PADDING))
+                        .rounded(px(10.))
+                        .bg(rgba(0x23262df5))
+                        .border_1()
+                        .border_color(rgb(0x353a45))
+                        .shadow(floating_shadow())
+                        .text_color(theme::text())
+                        .font_family(theme::UI_FONT)
+                        .children(rows)
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                            this.spell_menu = None;
+                            cx.notify();
+                        }))
+                        .with_animation(
+                            "spell-menu-in",
+                            Animation::new(anim::QUICK).with_easing(anim::ease_out),
+                            |el, t| el.opacity(t),
+                        ),
+                ),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
     }
 
     fn touch(&mut self) {
@@ -618,6 +822,10 @@ impl EditorView {
     }
 
     fn escape(&mut self, _: &Escape, window: &mut Window, cx: &mut Context<Self>) {
+        if self.spell_menu.take().is_some() {
+            cx.notify();
+            return;
+        }
         match self.mode {
             Mode::Focus => self.set_mode(Mode::Page, window, cx),
             Mode::Board if self.editing.is_some() || self.selected_item.is_some() => {
@@ -838,6 +1046,10 @@ impl EditorView {
             .child(mark_button("strike", "strikethrough", "Strikethrough (⇧⌘X)", Marks::STRIKE, cx))
             .child(mark_button("highlight", "highlighter", "Highlight (⇧⌘H)", Marks::HIGHLIGHT, cx))
             .child(div().flex_1())
+            .child(
+                icon_button("spelling", "spell-check", "Check spelling (⌥⌘L)", self.spellcheck)
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_spelling(cx))),
+            )
             .child(
                 div()
                     .px(px(8.))
@@ -1065,6 +1277,7 @@ impl EditorView {
             })
             .cursor(CursorStyle::IBeam)
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_mouse_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -1128,6 +1341,19 @@ impl EditorView {
             .with_animation("focus-enter", Animation::new(anim::STANDARD).with_easing(anim::ease_out), |el, t| {
                 el.opacity(t)
             })
+    }
+}
+
+/// Hooks for the UI integration tests.
+#[doc(hidden)]
+impl EditorView {
+    /// Window position of a document position, as of the last frame.
+    pub fn point_for(&self, pos: Pos) -> Option<Point<Pixels>> {
+        self.layout.as_ref()?.point_for_pos(pos)
+    }
+
+    pub fn spell_menu(&self) -> Option<(String, Vec<String>, Point<Pixels>)> {
+        self.spell_menu.as_ref().map(|m| (m.word.clone(), m.suggestions.clone(), m.at))
     }
 }
 
@@ -1264,7 +1490,9 @@ impl Render for EditorView {
             .on_action(cx.listener(|this, _: &ToggleHistory, _, cx| this.toggle_history(cx)))
             .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.zoom_step(true, cx)))
             .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.zoom_step(false, cx)))
-            .on_action(cx.listener(|this, _: &ZoomReset, _, cx| this.zoom_to(1., None, true, cx)));
+            .on_action(cx.listener(|this, _: &ZoomReset, _, cx| this.zoom_to(1., None, true, cx)))
+            .on_action(cx.listener(|this, _: &ToggleSpelling, _, cx| this.toggle_spelling(cx)))
+            .children(self.spell_menu_element(cx));
 
         if self.mode == Mode::Focus {
             return root.child(self.render_focus(cx)).into_any_element();

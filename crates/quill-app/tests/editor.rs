@@ -1,8 +1,8 @@
 //! Drives the real editor in an offscreen window with real mouse, trackpad
-//! and keyboard events, through every whiteboard tool, and saves screenshots
-//! to `target/whiteboard/` for review.
+//! and keyboard events — every whiteboard tool, zooming and spellcheck — and
+//! saves screenshots to `target/ui-shots/` for review.
 //!
-//! cargo test -p quill --features screenshots --test whiteboard
+//! cargo test -p quill --features screenshots --test editor
 
 use std::cell::RefCell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -15,9 +15,9 @@ use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::*;
 use quill::assets::Assets;
 use quill::board::Tool;
-use quill::editor::{EditorView, Mode};
+use quill::editor::{EditorView, MENU_PADDING, MENU_ROW, Mode};
 use quill::media::Media;
-use quill_doc::Document;
+use quill_doc::{Document, Pos};
 use quill_store::{DocId, ItemKind, Library};
 
 struct Harness {
@@ -31,6 +31,10 @@ struct Harness {
 }
 
 fn harness(name: &'static str) -> Harness {
+    harness_with(name, "The lamp had burned every night for forty-one years.")
+}
+
+fn harness_with(name: &'static str, text: &str) -> Harness {
     let mut cx = HeadlessAppContext::with_platform(
         gpui_kit::platform::current_platform(true).text_system(),
         Arc::new(Assets),
@@ -42,7 +46,7 @@ fn harness(name: &'static str) -> Harness {
         quill::editor::bind_keys(cx);
     });
     let mut library = Library::open_in_memory().unwrap();
-    let doc = Document::from_plain_text("Test", "The lamp had burned every night for forty-one years.");
+    let doc = Document::from_plain_text("Test", text);
     let id = library.create(&doc, None).unwrap();
     let library = Rc::new(RefCell::new(library));
     let lib = library.clone();
@@ -61,7 +65,8 @@ fn harness(name: &'static str) -> Harness {
                 cx,
                 move |window, cx| {
                     let media = cx.new(|_| Media::idle());
-                    let editor = cx.new(|cx| EditorView::new(lib, id, doc, media, cx));
+                    let speller = Rc::new(RefCell::new(quill_spell::Speller::english()));
+                    let editor = cx.new(|cx| EditorView::new(lib, id, doc, media, speller, cx));
                     window.focus(&editor.focus_handle(cx), cx);
                     editor
                 },
@@ -94,6 +99,47 @@ impl Harness {
             self.cx.advance_clock(Duration::from_millis(90));
             self.frame();
         }
+    }
+
+    fn right_click(&mut self, at: Point<Pixels>) {
+        self.mv(at, false);
+        self.event(MouseDownEvent {
+            button: MouseButton::Right,
+            position: at,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        self.event(MouseUpEvent {
+            button: MouseButton::Right,
+            position: at,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+        });
+    }
+
+    /// The middle of a word on the page, for clicking on it.
+    fn word_at(&mut self, block: usize, offset: usize) -> Point<Pixels> {
+        let top = self.read(|e| e.point_for(Pos::new(block, offset))).expect("laid out");
+        point(top.x + px(2.), top.y + px(12.))
+    }
+
+    /// Clicks row `row` of the open spelling menu.
+    fn click_menu_row(&mut self, row: f32) {
+        let (_, _, at) = self.read(|e| e.spell_menu()).expect("menu open");
+        let target = point(at.x + px(40.), at.y + px(MENU_PADDING + MENU_ROW * row + MENU_ROW / 2.));
+        self.click(target);
+    }
+
+    fn misspelled(&mut self) -> Vec<String> {
+        self.read(|e| {
+            let text = e.doc.blocks.iter().map(|b| b.text()).collect::<Vec<_>>();
+            e.misspellings()
+                .iter()
+                .enumerate()
+                .flat_map(|(i, ranges)| ranges.iter().map(|r| text[i][r.clone()].to_string()).collect::<Vec<_>>())
+                .collect()
+        })
     }
 
     fn event(&mut self, event: impl InputEvent) {
@@ -204,7 +250,7 @@ impl Harness {
 
     fn shot(&mut self, label: &str) {
         self.settle();
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/whiteboard");
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/ui-shots");
         std::fs::create_dir_all(&dir).unwrap();
         self.shots += 1;
         let path = dir.join(format!("{}-{}-{label}.png", self.name, self.shots));
@@ -442,6 +488,49 @@ fn pinch_and_keyboard_zoom() {
     assert!((h.read(|e| e.zoom_level()) - 1.).abs() < 0.05, "⌘= zooms back in");
 }
 
+fn misspelled_word_is_underlined_and_corrected_from_the_menu() {
+    let mut h = harness_with("spelling", "The wind smelled of rain and kelpe.");
+    assert_eq!(h.misspelled(), ["kelpe"]);
+    let start = h.read(|e| e.doc.blocks[0].text().find("kelpe").unwrap());
+    let word = h.word_at(0, start + 2);
+    h.right_click(word);
+    let (menu_word, suggestions, _) = h.read(|e| e.spell_menu()).expect("right-clicking a misspelling opens the menu");
+    assert_eq!(menu_word, "kelpe");
+    let kelp = suggestions.iter().position(|w| w == "kelp").expect("kelp is suggested");
+    h.shot("menu");
+    h.click_menu_row(kelp as f32);
+    assert_eq!(h.read(|e| e.doc.plain_text()), "The wind smelled of rain and kelp.");
+    assert!(h.misspelled().is_empty());
+    assert!(h.read(|e| e.spell_menu()).is_none(), "choosing a suggestion closes the menu");
+    h.shot("fixed");
+}
+
+fn learn_spelling_is_remembered() {
+    let mut h = harness_with("learn", "Elias Marr kept the light.");
+    assert_eq!(h.misspelled(), ["Marr"]);
+    let word = h.word_at(0, 7);
+    h.right_click(word);
+    let (_, suggestions, _) = h.read(|e| e.spell_menu()).expect("menu open");
+    // Suggestions (or "No guesses"), a divider, then Learn Spelling.
+    let rows = suggestions.len().max(1) as f32;
+    h.click_menu_row(rows + 9. / MENU_ROW);
+    assert!(h.misspelled().is_empty(), "the learned word is no longer flagged");
+    assert_eq!(h.library.borrow().learned_words().unwrap(), ["Marr"], "and is saved to the library");
+}
+
+fn word_being_typed_is_flagged_only_once_finished() {
+    let mut h = harness_with("typing", "Start");
+    let end = h.read(|e| e.doc.end());
+    let at = h.word_at(0, end.offset);
+    h.click(at);
+    h.type_text(" teh");
+    assert!(h.misspelled().is_empty(), "no red line while the word is still being typed");
+    h.type_text(" ");
+    assert_eq!(h.misspelled(), ["teh"], "flagged as soon as the word is finished");
+    h.keys("cmd-alt-l");
+    assert!(h.misspelled().is_empty(), "⌥⌘L turns spellcheck off");
+}
+
 fn main() {
     let tests: &[(&str, fn())] = &[
         ("sticky note is created, typed into and kept", sticky_note_is_created_typed_into_and_kept),
@@ -455,6 +544,12 @@ fn main() {
         ("image tool places an image", image_tool_places_an_image),
         ("clicking page and board switches modes", clicking_page_and_board_switches_modes),
         ("pinch and keyboard zoom", pinch_and_keyboard_zoom),
+        (
+            "misspelled word is underlined and corrected from the menu",
+            misspelled_word_is_underlined_and_corrected_from_the_menu,
+        ),
+        ("learn spelling is remembered", learn_spelling_is_remembered),
+        ("word being typed is flagged only once finished", word_being_typed_is_flagged_only_once_finished),
     ];
     let mut failed = Vec::new();
     for (name, test) in tests {

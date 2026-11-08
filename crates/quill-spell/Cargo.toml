@@ -1,0 +1,9 @@
+[package]
+name = "quill-spell"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+spellbook = "0.4.2"
+unicode-segmentation = "1.13.3"

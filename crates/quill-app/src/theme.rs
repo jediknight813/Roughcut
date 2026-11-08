@@ -55,6 +55,10 @@ pub fn text_dimmed() -> Hsla {
     rgba(0xe6e8ec47).into()
 }
 
+pub fn misspelled() -> Hsla {
+    rgb(0xf87171).into()
+}
+
 pub fn highlight() -> Hsla {
     rgba(0xfacc1559).into()
 }

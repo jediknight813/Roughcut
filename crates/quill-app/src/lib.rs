@@ -39,6 +39,7 @@ enum Screen {
 
 struct QuillApp {
     library: Rc<RefCell<Library>>,
+    speller: Rc<RefCell<quill_spell::Speller>>,
     /// Bumped on every screen change so the new screen animates in.
     screen_gen: usize,
     media: Entity<Media>,
@@ -47,10 +48,16 @@ struct QuillApp {
 }
 
 impl QuillApp {
-    fn new(library: Rc<RefCell<Library>>, notice: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        library: Rc<RefCell<Library>>,
+        speller: Rc<RefCell<quill_spell::Speller>>,
+        notice: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let media = cx.new(Media::new);
         let (screen, subscription) = Self::home(library.clone(), notice, window, cx);
-        QuillApp { library, screen_gen: 0, media, screen, _subscription: subscription }
+        QuillApp { library, speller, screen_gen: 0, media, screen, _subscription: subscription }
     }
 
     fn home(
@@ -119,8 +126,8 @@ impl QuillApp {
                 return;
             }
         };
-        let (library, media) = (self.library.clone(), self.media.clone());
-        let editor = cx.new(|cx| EditorView::new(library, id, doc, media, cx));
+        let (library, media, speller) = (self.library.clone(), self.media.clone(), self.speller.clone());
+        let editor = cx.new(|cx| EditorView::new(library, id, doc, media, speller, cx));
         window.focus(&editor.focus_handle(cx), cx);
         self._subscription = cx.subscribe_in(&editor, window, |this, _, event, window, cx| match event {
             EditorEvent::Close => this.show_home(window, cx),
@@ -186,6 +193,11 @@ pub fn run() {
         }
     }
     locations.back_up(&library);
+    let mut speller = quill_spell::Speller::english();
+    for word in library.learned_words().unwrap_or_default() {
+        speller.learn(&word);
+    }
+    let speller = Rc::new(RefCell::new(speller));
     let library = Rc::new(RefCell::new(library));
     let notice = storage::describe(&recovery);
 
@@ -219,7 +231,7 @@ pub fn run() {
             ..Default::default()
         };
         let window = gpui_kit::open_window(options, cx, move |window, cx| {
-            cx.new(|cx| QuillApp::new(library, notice, window, cx))
+            cx.new(|cx| QuillApp::new(library, speller, notice, window, cx))
         })
         .expect("failed to open window");
         #[cfg(feature = "screenshots")]

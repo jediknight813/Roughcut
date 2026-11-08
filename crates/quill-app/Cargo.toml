@@ -20,11 +20,15 @@ quill-doc = { version = "0.1.0", path = "../quill-doc" }
 quill-import = { version = "0.1.0", path = "../quill-import" }
 quill-store = { version = "0.1.0", path = "../quill-store" }
 ureq = { version = "3.5.1", default-features = false, features = ["rustls"] }
+quill-spell = { version = "0.1.0", path = "../quill-spell" }
 
 # Drives the real editor offscreen with simulated mouse and keyboard input.
-# Run: cargo test -p quill --features screenshots --test whiteboard
+# Run: cargo test -p quill --features screenshots --test editor
 [[test]]
-name = "whiteboard"
-path = "tests/whiteboard.rs"
+name = "editor"
+path = "tests/editor.rs"
 harness = false
 required-features = ["screenshots"]
+
+[dev-dependencies]
+quill-spell = { path = "../quill-spell" }

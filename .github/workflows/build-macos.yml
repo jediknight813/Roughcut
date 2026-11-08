@@ -28,7 +28,7 @@ jobs:
       - name: Test
         run: |
           cargo test --workspace
-          cargo test -p quill --features screenshots --test whiteboard
+          cargo test -p quill --features screenshots --test editor
 
       - name: Build and bundle
         id: bundle

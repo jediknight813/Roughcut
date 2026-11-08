@@ -46,6 +46,7 @@ static ICONS: &[(&str, &[u8])] = icons!(
     "skip-back",
     "skip-forward",
     "sparkles",
+    "spell-check",
     "square",
     "sticky-note",
     "strikethrough",

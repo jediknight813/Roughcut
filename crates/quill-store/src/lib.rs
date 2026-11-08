@@ -151,6 +151,12 @@ impl Library {
             conn.execute_batch(board::SCHEMA)?;
             conn.pragma_update(None, "user_version", 2)?;
         }
+        if version < 3 {
+            conn.execute_batch(
+                "CREATE TABLE learned_words (word TEXT PRIMARY KEY COLLATE NOCASE, created_at INTEGER NOT NULL);",
+            )?;
+            conn.pragma_update(None, "user_version", 3)?;
+        }
         Ok(Library { conn, heads: HashMap::new() })
     }
 
@@ -376,6 +382,23 @@ impl Library {
     }
 }
 
+impl Library {
+    /// Words the user taught the spellchecker.
+    pub fn learned_words(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT word FROM learned_words ORDER BY word")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn learn_word(&mut self, word: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO learned_words (word, created_at) VALUES (?1, ?2)",
+            params![word, Timestamp::now().as_second()],
+        )?;
+        Ok(())
+    }
+}
+
 /// Today's date in the system time zone.
 pub fn today() -> Date {
     jiff::Zoned::now().date()
@@ -495,6 +518,15 @@ mod tests {
         assert_eq!(stats.recent_days[4], (date(2026, 11, 4), 3));
 
         assert_eq!(lib.stats(date(2026, 11, 7), 1).unwrap().current_streak, 0);
+    }
+
+    #[test]
+    fn learned_words_persist_without_duplicates() {
+        let mut lib = Library::open_in_memory().unwrap();
+        lib.learn_word("Marr").unwrap();
+        lib.learn_word("marr").unwrap();
+        lib.learn_word("Carrow").unwrap();
+        assert_eq!(lib.learned_words().unwrap(), ["Carrow", "Marr"]);
     }
 
     #[test]

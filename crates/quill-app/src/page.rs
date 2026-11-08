@@ -2,6 +2,8 @@
 //! between screen points and document positions for the editor.
 
 use gpui_kit::*;
+use std::ops::Range;
+
 use quill_doc::{Block, BlockKind, Document, Marks, Pos};
 
 use crate::editor::EditorView;
@@ -62,7 +64,13 @@ pub struct PageLayout {
 impl PageLayout {
     /// Lays out `doc` at `scale` (1.0 = writing size). With `dim_except`,
     /// every block but that one is faded, for focus mode.
-    pub fn shape(doc: &Document, scale: f32, dim_except: Option<usize>, window: &mut Window) -> PageLayout {
+    pub fn shape(
+        doc: &Document,
+        scale: f32,
+        dim_except: Option<usize>,
+        misspelled: &[Vec<Range<usize>>],
+        window: &mut Window,
+    ) -> PageLayout {
         let mut y = px(0.);
         let mut number = 0;
         let blocks = doc
@@ -75,7 +83,7 @@ impl PageLayout {
                     if dim_except.is_some_and(|keep| keep != i) { theme::text_dimmed() } else { theme::text().into() };
                 let font_size = px(style.size);
                 let line_height = px(style.size * 1.6);
-                let runs = runs(block, &style, color);
+                let runs = runs(block, &style, color, misspelled.get(i).map_or(&[][..], Vec::as_slice));
                 let line = window
                     .text_system()
                     .shape_text(
@@ -190,31 +198,48 @@ fn plain_run(style: &BlockStyle, color: Hsla) -> TextRun {
     }
 }
 
-fn runs(block: &Block, style: &BlockStyle, color: Hsla) -> Vec<TextRun> {
+/// Text runs for a block: one per span, split further wherever a
+/// misspelled word starts or ends so it can carry a wavy underline.
+fn runs(block: &Block, style: &BlockStyle, color: Hsla, misspelled: &[Range<usize>]) -> Vec<TextRun> {
     let base = plain_run(style, color);
-    block
-        .spans
-        .iter()
-        .map(|span| {
-            let mut run = TextRun { len: span.text.len(), ..base.clone() };
-            if span.marks.contains(Marks::BOLD) {
-                run.font.weight = FontWeight::BOLD;
+    let mut out = Vec::new();
+    let mut start = 0;
+    for span in &block.spans {
+        let end = start + span.text.len();
+        let mut run = TextRun { len: 0, ..base.clone() };
+        if span.marks.contains(Marks::BOLD) {
+            run.font.weight = FontWeight::BOLD;
+        }
+        if span.marks.contains(Marks::ITALIC) {
+            run.font.style = if style.italic { FontStyle::Normal } else { FontStyle::Italic };
+        }
+        if span.marks.contains(Marks::UNDERLINE) {
+            run.underline = Some(UnderlineStyle { color: Some(run.color), thickness: px(1.), wavy: false });
+        }
+        if span.marks.contains(Marks::STRIKE) {
+            run.strikethrough = Some(StrikethroughStyle { color: Some(run.color), thickness: px(1.) });
+        }
+        if span.marks.contains(Marks::HIGHLIGHT) {
+            run.background_color = Some(theme::highlight());
+        }
+        let mut cuts: Vec<usize> =
+            misspelled.iter().flat_map(|r| [r.start, r.end]).filter(|&c| c > start && c < end).collect();
+        cuts.push(end);
+        cuts.sort_unstable();
+        cuts.dedup();
+        let mut from = start;
+        for to in cuts {
+            let mut piece = TextRun { len: to - from, ..run.clone() };
+            if misspelled.iter().any(|r| r.start <= from && to <= r.end) {
+                piece.underline =
+                    Some(UnderlineStyle { color: Some(theme::misspelled()), thickness: px(1.5), wavy: true });
             }
-            if span.marks.contains(Marks::ITALIC) {
-                run.font.style = if style.italic { FontStyle::Normal } else { FontStyle::Italic };
-            }
-            if span.marks.contains(Marks::UNDERLINE) {
-                run.underline = Some(UnderlineStyle { color: Some(run.color), thickness: px(1.), wavy: false });
-            }
-            if span.marks.contains(Marks::STRIKE) {
-                run.strikethrough = Some(StrikethroughStyle { color: Some(run.color), thickness: px(1.) });
-            }
-            if span.marks.contains(Marks::HIGHLIGHT) {
-                run.background_color = Some(theme::highlight());
-            }
-            run
-        })
-        .collect()
+            out.push(piece);
+            from = to;
+        }
+        start = end;
+    }
+    out
 }
 
 pub struct PageElement {
@@ -254,7 +279,8 @@ impl Element for PageElement {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let editor = self.editor.read(cx);
-        let layout = PageLayout::shape(&editor.doc, editor.page_scale(), editor.dim_except(), window);
+        let misspelled = editor.misspellings();
+        let layout = PageLayout::shape(&editor.doc, editor.page_scale(), editor.dim_except(), &misspelled, window);
         let mut style = Style::default();
         style.size.width = layout.width.into();
         style.size.height = layout.height.into();
