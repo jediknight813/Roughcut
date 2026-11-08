@@ -1,0 +1,17 @@
+[package]
+name = "quill-import"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+encoding_rs = "0.8.44"
+pulldown-cmark = "0.13.6"
+quick-xml = "0.42.0"
+quill-doc = { version = "0.1.0", path = "../quill-doc" }
+scraper = "0.29.0"
+thiserror = "2.0.21"
+zip = { version = "9.4.2", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

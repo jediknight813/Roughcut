@@ -29,14 +29,8 @@ impl Locations {
             return Locations {
                 library: home.join("library.db"),
                 backups: vec![
-                    BackupTarget {
-                        dir: home.join("Backups"),
-                        keep: 48,
-                    },
-                    BackupTarget {
-                        dir: home.join("Documents Backups"),
-                        keep: 30,
-                    },
+                    BackupTarget { dir: home.join("Backups"), keep: 48 },
+                    BackupTarget { dir: home.join("Documents Backups"), keep: 30 },
                 ],
             };
         }
@@ -48,14 +42,8 @@ impl Locations {
         Locations {
             library: app.join("library.db"),
             backups: vec![
-                BackupTarget {
-                    dir: app.join("Backups"),
-                    keep: 48,
-                },
-                BackupTarget {
-                    dir: documents.join("Quill Backups"),
-                    keep: 30,
-                },
+                BackupTarget { dir: app.join("Backups"), keep: 48 },
+                BackupTarget { dir: documents.join("Quill Backups"), keep: 30 },
             ],
         }
     }
@@ -81,10 +69,9 @@ impl Locations {
 pub fn describe(recovery: &Recovery) -> Option<String> {
     match recovery {
         Recovery::Clean | Recovery::New => None,
-        Recovery::Restored { from, .. } => Some(format!(
-            "Your library was damaged or missing and was restored from {}.",
-            from.display()
-        )),
+        Recovery::Restored { from, .. } => {
+            Some(format!("Your library was damaged or missing and was restored from {}.", from.display()))
+        }
         Recovery::Unrecoverable { damaged } => Some(format!(
             "Your library was damaged and no backup could be read. The damaged file was kept at {}.",
             damaged.display()

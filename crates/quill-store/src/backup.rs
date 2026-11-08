@@ -20,10 +20,7 @@ pub enum Recovery {
     New,
     /// The library was damaged (moved to `damaged`) or missing, and `from`
     /// was restored in its place.
-    Restored {
-        from: PathBuf,
-        damaged: Option<PathBuf>,
-    },
+    Restored { from: PathBuf, damaged: Option<PathBuf> },
     /// The library was damaged and no healthy backup exists. It was moved to
     /// `damaged` and a fresh library created; nothing was deleted.
     Unrecoverable { damaged: PathBuf },
@@ -44,13 +41,10 @@ impl Library {
         let target = dir.join(&name);
         let partial = dir.join(format!("{name}.partial"));
         let _ = fs::remove_file(&partial);
-        self.conn
-            .execute("VACUUM INTO ?1", [partial.to_string_lossy()])?;
+        self.conn.execute("VACUUM INTO ?1", [partial.to_string_lossy()])?;
         if !is_healthy(&partial) {
             let _ = fs::remove_file(&partial);
-            return Err(
-                io::Error::new(io::ErrorKind::InvalidData, "backup failed verification").into(),
-            );
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "backup failed verification").into());
         }
         fs::rename(&partial, &target)?;
         for old in backups_in(dir).into_iter().skip(keep) {
@@ -93,12 +87,8 @@ fn is_healthy(path: &Path) -> bool {
     let Ok(conn) = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
         return false;
     };
-    let ok = conn
-        .query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
-        .is_ok_and(|s| s == "ok");
-    ok && conn
-        .query_row("SELECT count(*) FROM documents", [], |r| r.get::<_, i64>(0))
-        .is_ok()
+    let ok = conn.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0)).is_ok_and(|s| s == "ok");
+    ok && conn.query_row("SELECT count(*) FROM documents", [], |r| r.get::<_, i64>(0)).is_ok()
 }
 
 /// Renames the library and its WAL files out of the way, keeping them for
@@ -124,11 +114,7 @@ fn backups_in(dir: &Path) -> Vec<PathBuf> {
         .flatten()
         .flatten()
         .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with(PREFIX) && n.ends_with(".db"))
-        })
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(PREFIX) && n.ends_with(".db")))
         .collect();
     found.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
     found
@@ -144,8 +130,7 @@ mod tests {
 
     fn library_with_doc(path: &Path, text: &str) -> Library {
         let mut lib = Library::open(path).unwrap();
-        lib.create(&Document::from_plain_text("Novel", text), None)
-            .unwrap();
+        lib.create(&Document::from_plain_text("Novel", text), None).unwrap();
         lib
     }
 
@@ -181,19 +166,13 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(5));
         {
             let mut lib = Library::open(&path).unwrap();
-            lib.create(&Document::from_plain_text("Second", "newer"), None)
-                .unwrap();
+            lib.create(&Document::from_plain_text("Second", "newer"), None).unwrap();
             lib.backup_to(&near, 10).unwrap();
         }
         corrupt(&path);
 
-        let (lib, recovery) =
-            Library::open_or_recover(&path, &[far.clone(), near.clone()]).unwrap();
-        let Recovery::Restored {
-            from,
-            damaged: Some(damaged),
-        } = recovery
-        else {
+        let (lib, recovery) = Library::open_or_recover(&path, &[far.clone(), near.clone()]).unwrap();
+        let Recovery::Restored { from, damaged: Some(damaged) } = recovery else {
             panic!("expected a restore, got {recovery:?}");
         };
         assert!(from.starts_with(&near), "newest backup wins across folders");
@@ -206,9 +185,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("library.db");
         let backups = dir.path().join("b");
-        library_with_doc(&path, "keep me")
-            .backup_to(&backups, 5)
-            .unwrap();
+        library_with_doc(&path, "keep me").backup_to(&backups, 5).unwrap();
         fs::remove_file(&path).unwrap();
         let _ = fs::remove_file(dir.path().join("library.db-wal"));
         let _ = fs::remove_file(dir.path().join("library.db-shm"));
@@ -228,9 +205,7 @@ mod tests {
 
         corrupt(&path);
         let (lib, recovery) = Library::open_or_recover(&path, &[dir.path().join("none")]).unwrap();
-        let Recovery::Unrecoverable { damaged } = recovery else {
-            panic!("{recovery:?}")
-        };
+        let Recovery::Unrecoverable { damaged } = recovery else { panic!("{recovery:?}") };
         assert!(damaged.exists());
         assert!(lib.list(None).unwrap().is_empty());
     }

@@ -8,4 +8,5 @@ directories = "6.0.0"
 gpui-kit = "0.9.0"
 jiff = "0.2.40"
 quill-doc = { version = "0.1.0", path = "../quill-doc" }
+quill-import = { version = "0.1.0", path = "../quill-import" }
 quill-store = { version = "0.1.0", path = "../quill-store" }

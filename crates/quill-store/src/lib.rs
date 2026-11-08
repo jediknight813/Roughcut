@@ -4,9 +4,11 @@
 //! network.
 
 mod backup;
+mod board;
 mod revisions;
 
 pub use backup::Recovery;
+pub use board::{AssetId, BoardItem, ItemId, ItemKind};
 pub use revisions::{RevId, Revision};
 
 use std::collections::HashMap;
@@ -117,8 +119,7 @@ CREATE TABLE writing_days (
 );
 ";
 
-const SUMMARY_COLUMNS: &str =
-    "d.id, d.title, d.collection, d.word_count, d.opened_at, substr(d.plain_text, 1, 280)";
+const SUMMARY_COLUMNS: &str = "d.id, d.title, d.collection, d.word_count, d.opened_at, substr(d.plain_text, 1, 280)";
 
 pub struct Library {
     conn: Connection,
@@ -142,14 +143,15 @@ impl Library {
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", true)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version == 0 {
+        if version < 1 {
             conn.execute_batch(SCHEMA)?;
             conn.pragma_update(None, "user_version", 1)?;
         }
-        Ok(Library {
-            conn,
-            heads: HashMap::new(),
-        })
+        if version < 2 {
+            conn.execute_batch(board::SCHEMA)?;
+            conn.pragma_update(None, "user_version", 2)?;
+        }
+        Ok(Library { conn, heads: HashMap::new() })
     }
 
     /// Adds a document with its first revision. Its existing words don't
@@ -165,18 +167,8 @@ impl Library {
             params![doc.title, collection, json, doc.plain_text(), doc.word_count() as i64, now],
         )?;
         let id = tx.last_insert_rowid();
-        let rev = revisions::append(
-            &tx,
-            id,
-            None,
-            &json,
-            doc.word_count() as i64,
-            Pos::default(),
-        )?;
-        tx.execute(
-            "UPDATE documents SET head = ?2 WHERE id = ?1",
-            params![id, rev],
-        )?;
+        let rev = revisions::append(&tx, id, None, &json, doc.word_count() as i64, Pos::default())?;
+        tx.execute("UPDATE documents SET head = ?2 WHERE id = ?1", params![id, rev])?;
         tx.commit()?;
         self.heads.insert(id, (rev, json));
         Ok(id)
@@ -186,17 +178,11 @@ impl Library {
     pub fn open_document(&mut self, id: DocId) -> Result<Document> {
         let (body, head): (String, RevId) = self
             .conn
-            .query_row(
-                "SELECT body, head FROM documents WHERE id = ?1",
-                [id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+            .query_row("SELECT body, head FROM documents WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?
             .ok_or(Error::NotFound(id))?;
-        self.conn.execute(
-            "UPDATE documents SET opened_at = ?2 WHERE id = ?1",
-            params![id, Timestamp::now().as_second()],
-        )?;
+        self.conn
+            .execute("UPDATE documents SET opened_at = ?2 WHERE id = ?1", params![id, Timestamp::now().as_second()])?;
         let doc = serde_json::from_str(&body)?;
         self.heads.insert(id, (head, body));
         Ok(doc)
@@ -219,11 +205,7 @@ impl Library {
         }
         let words = doc.word_count() as i64;
         let tx = self.conn.transaction()?;
-        let old: i64 = tx.query_row(
-            "SELECT word_count FROM documents WHERE id = ?1",
-            [id],
-            |r| r.get(0),
-        )?;
+        let old: i64 = tx.query_row("SELECT word_count FROM documents WHERE id = ?1", [id], |r| r.get(0))?;
         let rev = revisions::append(&tx, id, Some((parent, &parent_json)), &json, words, cursor)?;
         set_current(&tx, id, doc, &json, rev)?;
         if words > old {
@@ -277,9 +259,7 @@ impl Library {
 
     pub fn head(&self, id: DocId) -> Result<RevId> {
         self.conn
-            .query_row("SELECT head FROM documents WHERE id = ?1", [id], |r| {
-                r.get(0)
-            })
+            .query_row("SELECT head FROM documents WHERE id = ?1", [id], |r| r.get(0))
             .optional()?
             .ok_or(Error::NotFound(id))
     }
@@ -287,16 +267,13 @@ impl Library {
     /// Moves a document to the trash. It and its history stay in the
     /// library and can be restored.
     pub fn trash(&mut self, id: DocId) -> Result<()> {
-        self.conn.execute(
-            "UPDATE documents SET trashed_at = ?2 WHERE id = ?1",
-            params![id, Timestamp::now().as_second()],
-        )?;
+        self.conn
+            .execute("UPDATE documents SET trashed_at = ?2 WHERE id = ?1", params![id, Timestamp::now().as_second()])?;
         Ok(())
     }
 
     pub fn restore(&mut self, id: DocId) -> Result<()> {
-        self.conn
-            .execute("UPDATE documents SET trashed_at = NULL WHERE id = ?1", [id])?;
+        self.conn.execute("UPDATE documents SET trashed_at = NULL WHERE id = ?1", [id])?;
         Ok(())
     }
 
@@ -333,10 +310,7 @@ impl Library {
 
     /// Full-text search over titles and bodies; each word matches as a prefix.
     pub fn search(&self, query: &str) -> Result<Vec<DocSummary>> {
-        let terms: Vec<String> = query
-            .split_whitespace()
-            .map(|t| format!("\"{}\"*", t.replace('"', "\"\"")))
-            .collect();
+        let terms: Vec<String> = query.split_whitespace().map(|t| format!("\"{}\"*", t.replace('"', "\"\""))).collect();
         if terms.is_empty() {
             return self.list(None);
         }
@@ -350,20 +324,12 @@ impl Library {
     }
 
     pub fn stats(&self, today: Date, recent: usize) -> Result<Stats> {
-        let documents: i64 = self.conn.query_row(
-            "SELECT count(*) FROM documents WHERE trashed_at IS NULL",
-            [],
-            |r| r.get(0),
-        )?;
-        let mut stmt = self
-            .conn
-            .prepare("SELECT day, words FROM writing_days WHERE words > 0 ORDER BY day")?;
+        let documents: i64 =
+            self.conn.query_row("SELECT count(*) FROM documents WHERE trashed_at IS NULL", [], |r| r.get(0))?;
+        let mut stmt = self.conn.prepare("SELECT day, words FROM writing_days WHERE words > 0 ORDER BY day")?;
         let days = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
-            .filter_map(|row| {
-                row.ok()
-                    .and_then(|(d, w)| d.parse::<Date>().ok().map(|d| (d, w)))
-            })
+            .filter_map(|row| row.ok().and_then(|(d, w)| d.parse::<Date>().ok().map(|d| (d, w))))
             .collect::<Vec<_>>();
 
         let words_on = |date: Date| days.iter().find(|(d, _)| *d == date).map_or(0, |(_, w)| *w);
@@ -382,11 +348,7 @@ impl Library {
 
         // A streak survives until the end of the day after the last writing day.
         let mut current = 0;
-        let mut cursor = if words_on(today) > 0 {
-            Some(today)
-        } else {
-            today.yesterday().ok()
-        };
+        let mut cursor = if words_on(today) > 0 { Some(today) } else { today.yesterday().ok() };
         while let Some(day) = cursor.filter(|&d| words_on(d) > 0) {
             current += 1;
             cursor = day.yesterday().ok();
@@ -419,13 +381,7 @@ pub fn today() -> Date {
     jiff::Zoned::now().date()
 }
 
-fn set_current(
-    tx: &rusqlite::Transaction<'_>,
-    id: DocId,
-    doc: &Document,
-    json: &str,
-    rev: RevId,
-) -> Result<()> {
+fn set_current(tx: &rusqlite::Transaction<'_>, id: DocId, doc: &Document, json: &str, rev: RevId) -> Result<()> {
     tx.execute(
         "UPDATE documents SET title = ?2, body = ?3, plain_text = ?4, word_count = ?5, head = ?6, updated_at = ?7
          WHERE id = ?1",
@@ -457,10 +413,7 @@ mod tests {
         let mut lib = Library::open_in_memory().unwrap();
         let ids = docs
             .iter()
-            .map(|(title, text, col)| {
-                lib.create(&Document::from_plain_text(*title, text), *col)
-                    .unwrap()
-            })
+            .map(|(title, text, col)| lib.create(&Document::from_plain_text(*title, text), *col).unwrap())
             .collect();
         (lib, ids)
     }
@@ -478,11 +431,7 @@ mod tests {
 
     #[test]
     fn list_filters_by_collection_and_hides_trash() {
-        let (mut lib, ids) = lib_with(&[
-            ("A", "", Some("Novel")),
-            ("B", "", Some("Letters")),
-            ("C", "", None),
-        ]);
+        let (mut lib, ids) = lib_with(&[("A", "", Some("Novel")), ("B", "", Some("Letters")), ("C", "", None)]);
         assert_eq!(lib.list(None).unwrap().len(), 3);
         let novel = lib.list(Some("Novel")).unwrap();
         assert_eq!(novel.len(), 1);
@@ -539,10 +488,7 @@ mod tests {
         assert_eq!(stats.total_words_written, 7);
         assert_eq!(stats.documents, 1);
         assert_eq!(stats.today, 0);
-        assert_eq!(
-            stats.current_streak, 3,
-            "streak survives a day with no writing yet"
-        );
+        assert_eq!(stats.current_streak, 3, "streak survives a day with no writing yet");
         assert_eq!(stats.best_streak, 3);
         assert_eq!(stats.recent_days.len(), 7);
         assert_eq!(stats.recent_days[0], (date(2026, 10, 31), 0));

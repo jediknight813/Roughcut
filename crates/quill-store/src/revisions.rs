@@ -41,11 +41,9 @@ pub(crate) fn append(
     cursor: Pos,
 ) -> Result<RevId> {
     let parent_depth = match parent {
-        Some((rev, _)) => Some(conn.query_row(
-            "SELECT depth FROM revisions WHERE id = ?1",
-            [rev],
-            |r| r.get::<_, i64>(0),
-        )?),
+        Some((rev, _)) => {
+            Some(conn.query_row("SELECT depth FROM revisions WHERE id = ?1", [rev], |r| r.get::<_, i64>(0))?)
+        }
         None => None,
     };
     let (dict, depth) = match (parent, parent_depth) {
@@ -76,16 +74,12 @@ pub(crate) fn append(
 /// Rebuilds a revision's JSON by walking back to the nearest keyframe and
 /// replaying the deltas forward.
 pub(crate) fn load_json(conn: &Connection, doc_id: DocId, rev: RevId) -> Result<String> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT doc_id, parent, keyframe, size, data FROM revisions WHERE id = ?1",
-    )?;
+    let mut stmt = conn.prepare_cached("SELECT doc_id, parent, keyframe, size, data FROM revisions WHERE id = ?1")?;
     let mut chain = Vec::new();
     let mut next = Some(rev);
     while let Some(id) = next {
-        let (owner, parent, keyframe, size, data): (DocId, Option<RevId>, bool, i64, Vec<u8>) =
-            stmt.query_row([id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-            })
+        let (owner, parent, keyframe, size, data): (DocId, Option<RevId>, bool, i64, Vec<u8>) = stmt
+            .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
             .optional()?
             .ok_or(Error::NoRevision(id))?;
         if owner != doc_id {
@@ -102,40 +96,24 @@ pub(crate) fn load_json(conn: &Connection, doc_id: DocId, rev: RevId) -> Result<
 }
 
 pub(crate) fn parent(conn: &Connection, rev: RevId) -> Result<Option<RevId>> {
-    Ok(
-        conn.query_row("SELECT parent FROM revisions WHERE id = ?1", [rev], |r| {
-            r.get(0)
-        })?,
-    )
+    Ok(conn.query_row("SELECT parent FROM revisions WHERE id = ?1", [rev], |r| r.get(0))?)
 }
 
 pub(crate) fn newest_child(conn: &Connection, rev: RevId) -> Result<Option<RevId>> {
     Ok(conn
-        .query_row(
-            "SELECT id FROM revisions WHERE parent = ?1 ORDER BY id DESC LIMIT 1",
-            [rev],
-            |r| r.get(0),
-        )
+        .query_row("SELECT id FROM revisions WHERE parent = ?1 ORDER BY id DESC LIMIT 1", [rev], |r| r.get(0))
         .optional()?)
 }
 
 pub(crate) fn cursor(conn: &Connection, rev: RevId) -> Result<Pos> {
-    Ok(conn.query_row(
-        "SELECT cursor_block, cursor_offset FROM revisions WHERE id = ?1",
-        [rev],
-        |r| {
-            Ok(Pos::new(
-                r.get::<_, i64>(0)? as usize,
-                r.get::<_, i64>(1)? as usize,
-            ))
-        },
-    )?)
+    Ok(conn.query_row("SELECT cursor_block, cursor_offset FROM revisions WHERE id = ?1", [rev], |r| {
+        Ok(Pos::new(r.get::<_, i64>(0)? as usize, r.get::<_, i64>(1)? as usize))
+    })?)
 }
 
 pub(crate) fn list(conn: &Connection, doc_id: DocId) -> Result<Vec<Revision>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, parent, created_at, word_count FROM revisions WHERE doc_id = ?1 ORDER BY id",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT id, parent, created_at, word_count FROM revisions WHERE doc_id = ?1 ORDER BY id")?;
     let rows = stmt.query_map([doc_id], |r| {
         Ok(Revision {
             id: r.get(0)?,
@@ -197,27 +175,12 @@ mod tests {
         assert_eq!(lib.undo(id).unwrap().unwrap().0.plain_text(), "one");
         let (doc, cursor) = lib.redo(id).unwrap().unwrap();
         assert_eq!(doc.plain_text(), "one two");
-        assert_eq!(
-            cursor,
-            Pos::new(0, 7),
-            "cursor comes back with the revision"
-        );
-        assert_eq!(
-            lib.open_document(id).unwrap().plain_text(),
-            "one two",
-            "head is persisted"
-        );
+        assert_eq!(cursor, Pos::new(0, 7), "cursor comes back with the revision");
+        assert_eq!(lib.open_document(id).unwrap().plain_text(), "one two", "head is persisted");
 
         lib.undo(id).unwrap();
-        assert!(
-            lib.undo(id)
-                .unwrap()
-                .is_some_and(|(d, _)| d.plain_text().is_empty())
-        );
-        assert!(
-            lib.undo(id).unwrap().is_none(),
-            "nothing before the first revision"
-        );
+        assert!(lib.undo(id).unwrap().is_some_and(|(d, _)| d.plain_text().is_empty()));
+        assert!(lib.undo(id).unwrap().is_none(), "nothing before the first revision");
     }
 
     #[test]
@@ -230,18 +193,10 @@ mod tests {
         let (mut doc, _) = lib.undo(id).unwrap().unwrap();
         type_words(&mut lib, id, &mut doc, &[" new-ending"]);
         assert_eq!(lib.undo(id).unwrap().unwrap().0.plain_text(), "base");
-        assert_eq!(
-            lib.redo(id).unwrap().unwrap().0.plain_text(),
-            "base new-ending",
-            "redo follows the newest branch"
-        );
+        assert_eq!(lib.redo(id).unwrap().unwrap().0.plain_text(), "base new-ending", "redo follows the newest branch");
 
         let (old, _) = lib.checkout(id, first[1]).unwrap();
-        assert_eq!(
-            old.plain_text(),
-            "base old-ending",
-            "the abandoned branch is still there"
-        );
+        assert_eq!(old.plain_text(), "base old-ending", "the abandoned branch is still there");
         assert_eq!(lib.revisions(id).unwrap().len(), 4);
     }
 
@@ -260,10 +215,7 @@ mod tests {
             revs.push(lib.commit(id, &doc, cursor, DAY).unwrap());
             expected.push(doc.plain_text());
         }
-        let mut fresh = Library {
-            conn: lib.conn,
-            heads: Default::default(),
-        };
+        let mut fresh = Library { conn: lib.conn, heads: Default::default() };
         for (rev, text) in revs.iter().zip(&expected) {
             assert_eq!(&fresh.checkout(id, *rev).unwrap().0.plain_text(), text);
         }
@@ -276,18 +228,9 @@ mod tests {
         let mut doc = Document::from_plain_text("t", &vec![paragraph.as_str(); 50].join("\n"));
         let id = lib.create(&doc, None).unwrap();
         let rev = type_words(&mut lib, id, &mut doc, &[" Then the storm came."])[0];
-        let size: i64 = lib
-            .conn
-            .query_row(
-                "SELECT length(data) FROM revisions WHERE id = ?1",
-                [rev],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert!(
-            size < 400,
-            "a one-sentence edit to a ~100 KB document stored {size} bytes"
-        );
+        let size: i64 =
+            lib.conn.query_row("SELECT length(data) FROM revisions WHERE id = ?1", [rev], |r| r.get(0)).unwrap();
+        assert!(size < 400, "a one-sentence edit to a ~100 KB document stored {size} bytes");
     }
 
     #[test]
@@ -307,7 +250,10 @@ mod tests {
         let id = lib.create(&doc, None).unwrap();
         let rev = type_words(&mut lib, id, &mut doc, &[" more"])[0];
         lib.conn
-            .execute("UPDATE revisions SET data = substr(data, 1, length(data) - 6) || x'000000000000' WHERE id = ?1", [rev])
+            .execute(
+                "UPDATE revisions SET data = substr(data, 1, length(data) - 6) || x'000000000000' WHERE id = ?1",
+                [rev],
+            )
             .unwrap();
         assert!(load_json(&lib.conn, id, rev).is_err());
     }

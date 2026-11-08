@@ -19,37 +19,13 @@ struct BlockStyle {
 }
 
 fn block_style(kind: BlockKind) -> BlockStyle {
-    let body = BlockStyle {
-        size: 18.,
-        weight: FontWeight::NORMAL,
-        italic: false,
-        indent: 0.,
-        space_after: 14.,
-    };
+    let body = BlockStyle { size: 18., weight: FontWeight::NORMAL, italic: false, indent: 0., space_after: 14. };
     match kind {
         BlockKind::Paragraph => body,
-        BlockKind::Heading(1) => BlockStyle {
-            size: 32.,
-            weight: FontWeight::BOLD,
-            space_after: 20.,
-            ..body
-        },
-        BlockKind::Heading(_) => BlockStyle {
-            size: 23.,
-            weight: FontWeight::SEMIBOLD,
-            space_after: 12.,
-            ..body
-        },
-        BlockKind::Bullet | BlockKind::Numbered => BlockStyle {
-            indent: 28.,
-            space_after: 6.,
-            ..body
-        },
-        BlockKind::Quote => BlockStyle {
-            italic: true,
-            indent: 24.,
-            ..body
-        },
+        BlockKind::Heading(1) => BlockStyle { size: 32., weight: FontWeight::BOLD, space_after: 20., ..body },
+        BlockKind::Heading(_) => BlockStyle { size: 23., weight: FontWeight::SEMIBOLD, space_after: 12., ..body },
+        BlockKind::Bullet | BlockKind::Numbered => BlockStyle { indent: 28., space_after: 6., ..body },
+        BlockKind::Quote => BlockStyle { italic: true, indent: 24., ..body },
     }
 }
 
@@ -84,52 +60,27 @@ impl PageLayout {
                 let runs = runs(block, &style);
                 let line = window
                     .text_system()
-                    .shape_text(
-                        block.text().into(),
-                        font_size,
-                        &runs,
-                        Some(px(TEXT_WIDTH - style.indent)),
-                        None,
-                    )
+                    .shape_text(block.text().into(), font_size, &runs, Some(px(TEXT_WIDTH - style.indent)), None)
                     .ok()
                     .and_then(|lines| lines.into_iter().next())
                     .unwrap_or_default();
-                number = if block.kind == BlockKind::Numbered {
-                    number + 1
-                } else {
-                    0
-                };
+                number = if block.kind == BlockKind::Numbered { number + 1 } else { 0 };
                 let marker = match block.kind {
                     BlockKind::Bullet => Some("•".to_string()),
                     BlockKind::Numbered => Some(format!("{number}.")),
                     _ => None,
                 }
                 .map(|text| {
-                    let run = TextRun {
-                        len: text.len(),
-                        ..plain_run(&style)
-                    };
-                    window
-                        .text_system()
-                        .shape_line(text.into(), font_size, &[run], None)
+                    let run = TextRun { len: text.len(), ..plain_run(&style) };
+                    window.text_system().shape_line(text.into(), font_size, &[run], None)
                 });
                 let height = line.size(line_height).height.max(line_height);
-                let layout = BlockLayout {
-                    origin: point(px(style.indent), y),
-                    line_height,
-                    height,
-                    line,
-                    marker,
-                };
+                let layout = BlockLayout { origin: point(px(style.indent), y), line_height, height, line, marker };
                 y += height + px(style.space_after);
                 layout
             })
             .collect();
-        PageLayout {
-            blocks,
-            height: y,
-            left: px(0.),
-        }
+        PageLayout { blocks, height: y, left: px(0.) }
     }
 
     fn translate(&mut self, by: Point<Pixels>) {
@@ -142,10 +93,7 @@ impl PageLayout {
     /// Top of the caret for `pos`.
     pub fn point_for_pos(&self, pos: Pos) -> Option<Point<Pixels>> {
         let block = self.blocks.get(pos.block)?;
-        let local = block
-            .line
-            .position_for_index(pos.offset, block.line_height)
-            .unwrap_or_default();
+        let local = block.line.position_for_index(pos.offset, block.line_height).unwrap_or_default();
         Some(block.origin + local)
     }
 
@@ -157,18 +105,11 @@ impl PageLayout {
         let Some(last) = self.blocks.len().checked_sub(1) else {
             return Pos::default();
         };
-        let index = self
-            .blocks
-            .iter()
-            .position(|b| point.y < b.origin.y + b.height)
-            .unwrap_or(last);
+        let index = self.blocks.iter().position(|b| point.y < b.origin.y + b.height).unwrap_or(last);
         let block = &self.blocks[index];
         let local = point - block.origin;
         let local = gpui_kit::point(local.x, local.y.clamp(px(0.), block.height - px(1.)));
-        let offset = match block
-            .line
-            .closest_index_for_position(local, block.line_height)
-        {
+        let offset = match block.line.closest_index_for_position(local, block.line_height) {
             Ok(i) | Err(i) => i,
         };
         Pos::new(index, offset.min(block.line.len()))
@@ -181,15 +122,9 @@ impl PageLayout {
                 break;
             };
             let from = if i == start.block { start.offset } else { 0 };
-            let to = if i == end.block {
-                end.offset
-            } else {
-                block.line.len()
-            };
-            let (Some(a), Some(b)) = (
-                self.point_for_pos(Pos::new(i, from)),
-                self.point_for_pos(Pos::new(i, to)),
-            ) else {
+            let to = if i == end.block { end.offset } else { block.line.len() };
+            let (Some(a), Some(b)) = (self.point_for_pos(Pos::new(i, from)), self.point_for_pos(Pos::new(i, to)))
+            else {
                 continue;
             };
             let lh = block.line_height;
@@ -199,20 +134,12 @@ impl PageLayout {
             // so a selected empty line or line break is still visible.
             let tail = if i < end.block { px(8.) } else { px(0.) };
             if a.y == b.y {
-                quads.push(fill(
-                    Bounds::from_corners(a, point(b.x + tail, b.y + lh)),
-                    theme::selection(),
-                ));
+                quads.push(fill(Bounds::from_corners(a, point(b.x + tail, b.y + lh)), theme::selection()));
             } else {
-                quads.push(fill(
-                    Bounds::from_corners(a, point(right, a.y + lh)),
-                    theme::selection(),
-                ));
+                quads.push(fill(Bounds::from_corners(a, point(right, a.y + lh)), theme::selection()));
                 if b.y > a.y + lh {
-                    quads.push(fill(
-                        Bounds::from_corners(point(left, a.y + lh), point(right, b.y)),
-                        theme::selection(),
-                    ));
+                    quads
+                        .push(fill(Bounds::from_corners(point(left, a.y + lh), point(right, b.y)), theme::selection()));
                 }
                 quads.push(fill(
                     Bounds::from_corners(point(left, b.y), point(b.x + tail, b.y + lh)),
@@ -229,11 +156,7 @@ fn plain_run(style: &BlockStyle) -> TextRun {
         len: 0,
         font: Font {
             weight: style.weight,
-            style: if style.italic {
-                FontStyle::Italic
-            } else {
-                FontStyle::Normal
-            },
+            style: if style.italic { FontStyle::Italic } else { FontStyle::Normal },
             ..font(theme::PAGE_FONT)
         },
         color: theme::text().into(),
@@ -249,32 +172,18 @@ fn runs(block: &Block, style: &BlockStyle) -> Vec<TextRun> {
         .spans
         .iter()
         .map(|span| {
-            let mut run = TextRun {
-                len: span.text.len(),
-                ..base.clone()
-            };
+            let mut run = TextRun { len: span.text.len(), ..base.clone() };
             if span.marks.contains(Marks::BOLD) {
                 run.font.weight = FontWeight::BOLD;
             }
             if span.marks.contains(Marks::ITALIC) {
-                run.font.style = if style.italic {
-                    FontStyle::Normal
-                } else {
-                    FontStyle::Italic
-                };
+                run.font.style = if style.italic { FontStyle::Normal } else { FontStyle::Italic };
             }
             if span.marks.contains(Marks::UNDERLINE) {
-                run.underline = Some(UnderlineStyle {
-                    color: Some(run.color),
-                    thickness: px(1.),
-                    wavy: false,
-                });
+                run.underline = Some(UnderlineStyle { color: Some(run.color), thickness: px(1.), wavy: false });
             }
             if span.marks.contains(Marks::STRIKE) {
-                run.strikethrough = Some(StrikethroughStyle {
-                    color: Some(run.color),
-                    thickness: px(1.),
-                });
+                run.strikethrough = Some(StrikethroughStyle { color: Some(run.color), thickness: px(1.) });
             }
             if span.marks.contains(Marks::HIGHLIGHT) {
                 run.background_color = Some(theme::highlight());
@@ -340,23 +249,10 @@ impl Element for PageElement {
         layout.translate(bounds.origin);
         let editor = self.editor.read(cx);
         let (start, end) = editor.selection();
-        let selection = if start == end {
-            Vec::new()
-        } else {
-            layout.selection_quads(start, end)
-        };
-        let caret = (start == end)
-            .then(|| layout.point_for_pos(editor.head))
-            .flatten()
-            .map(|p| {
-                fill(
-                    Bounds::new(
-                        p,
-                        size(px(CARET_WIDTH), layout.line_height_at(editor.head.block)),
-                    ),
-                    theme::accent(),
-                )
-            });
+        let selection = if start == end { Vec::new() } else { layout.selection_quads(start, end) };
+        let caret = (start == end).then(|| layout.point_for_pos(editor.head)).flatten().map(|p| {
+            fill(Bounds::new(p, size(px(CARET_WIDTH), layout.line_height_at(editor.head.block))), theme::accent())
+        });
         Prepainted { selection, caret }
     }
 
@@ -372,43 +268,25 @@ impl Element for PageElement {
     ) {
         let layout = layout.take().expect("laid out");
         let focus = self.editor.read(cx).focus_handle.clone();
-        window.handle_input(
-            &focus,
-            ElementInputHandler::new(bounds, self.editor.clone()),
-            cx,
-        );
+        window.handle_input(&focus, ElementInputHandler::new(bounds, self.editor.clone()), cx);
 
         for quad in prepainted.selection.drain(..) {
             window.paint_quad(quad);
         }
         for block in &layout.blocks {
-            let _ = block.line.paint_background(
-                block.origin,
-                block.line_height,
-                TextAlign::Left,
-                None,
-                window,
-                cx,
-            );
-            let _ = block.line.paint(
-                block.origin,
-                block.line_height,
-                TextAlign::Left,
-                None,
-                window,
-                cx,
-            );
+            let _ = block.line.paint_background(block.origin, block.line_height, TextAlign::Left, None, window, cx);
+            let _ = block.line.paint(block.origin, block.line_height, TextAlign::Left, None, window, cx);
             if let Some(marker) = &block.marker {
                 let at = point(block.origin.x - px(22.), block.origin.y);
                 let _ = marker.paint(at, block.line_height, TextAlign::Left, None, window, cx);
             }
         }
         if focus.is_focused(window)
+            && self.editor.read(cx).mode != crate::editor::Mode::Board
             && let Some(caret) = prepainted.caret.take()
         {
             window.paint_quad(caret);
         }
-        self.editor
-            .update(cx, |editor, _| editor.layout = Some(layout));
+        self.editor.update(cx, |editor, _| editor.layout = Some(layout));
     }
 }

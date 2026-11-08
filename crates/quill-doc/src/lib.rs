@@ -56,10 +56,7 @@ pub struct Block {
 
 impl Block {
     pub fn new(kind: BlockKind, text: &str) -> Block {
-        let mut block = Block {
-            kind,
-            spans: Vec::new(),
-        };
+        let mut block = Block { kind, spans: Vec::new() };
         block.insert(0, text, Marks::NONE);
         block
     }
@@ -95,13 +92,7 @@ impl Block {
             return;
         }
         let idx = self.split_at(offset);
-        self.spans.insert(
-            idx,
-            Span {
-                text: text.to_owned(),
-                marks,
-            },
-        );
+        self.spans.insert(idx, Span { text: text.to_owned(), marks });
         self.normalize();
     }
 
@@ -174,10 +165,7 @@ impl Block {
             }
             start += len;
         }
-        assert!(
-            offset == start,
-            "offset {offset} past end of block ({start})"
-        );
+        assert!(offset == start, "offset {offset} past end of block ({start})");
         self.spans.len()
     }
 
@@ -196,9 +184,7 @@ impl Block {
     }
 }
 
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Pos {
     pub block: usize,
     pub offset: usize,
@@ -218,22 +204,13 @@ pub struct Document {
 
 impl Document {
     pub fn new(title: impl Into<String>) -> Document {
-        Document {
-            title: title.into(),
-            blocks: vec![Block::default()],
-        }
+        Document { title: title.into(), blocks: vec![Block::default()] }
     }
 
     /// One paragraph per line.
     pub fn from_plain_text(title: impl Into<String>, text: &str) -> Document {
-        let blocks = text
-            .lines()
-            .map(|line| Block::new(BlockKind::Paragraph, line))
-            .collect::<Vec<_>>();
-        let mut doc = Document {
-            title: title.into(),
-            blocks,
-        };
+        let blocks = text.lines().map(|line| Block::new(BlockKind::Paragraph, line)).collect::<Vec<_>>();
+        let mut doc = Document { title: title.into(), blocks };
         if doc.blocks.is_empty() {
             doc.blocks.push(Block::default());
         }
@@ -241,18 +218,11 @@ impl Document {
     }
 
     pub fn plain_text(&self) -> String {
-        self.blocks
-            .iter()
-            .map(Block::text)
-            .collect::<Vec<_>>()
-            .join("\n")
+        self.blocks.iter().map(Block::text).collect::<Vec<_>>().join("\n")
     }
 
     pub fn word_count(&self) -> usize {
-        self.blocks
-            .iter()
-            .map(|b| b.text().unicode_words().count())
-            .sum()
+        self.blocks.iter().map(|b| b.text().unicode_words().count()).sum()
     }
 
     pub fn end(&self) -> Pos {
@@ -302,9 +272,7 @@ impl Document {
     pub fn toggle_mark(&mut self, a: Pos, b: Pos, mark: Marks) {
         let (start, end) = if a <= b { (a, b) } else { (b, a) };
         let ranges = self.block_ranges(start, end);
-        let all = ranges
-            .iter()
-            .all(|&(i, s, e)| self.blocks[i].all_have(s, e, mark));
+        let all = ranges.iter().all(|&(i, s, e)| self.blocks[i].all_have(s, e, mark));
         for (i, s, e) in ranges {
             self.blocks[i].update_marks(s, e, |m| if all { m.without(mark) } else { m.with(mark) });
         }
@@ -323,10 +291,7 @@ impl Document {
             };
         }
         let text = self.blocks[pos.block].text();
-        let step = text[..pos.offset]
-            .graphemes(true)
-            .next_back()
-            .map_or(0, str::len);
+        let step = text[..pos.offset].graphemes(true).next_back().map_or(0, str::len);
         Pos::new(pos.block, pos.offset - step)
     }
 
@@ -334,27 +299,64 @@ impl Document {
     pub fn next_pos(&self, pos: Pos) -> Pos {
         let text = self.blocks[pos.block].text();
         if pos.offset >= text.len() {
-            return if pos.block + 1 < self.blocks.len() {
-                Pos::new(pos.block + 1, 0)
-            } else {
-                pos
-            };
+            return if pos.block + 1 < self.blocks.len() { Pos::new(pos.block + 1, 0) } else { pos };
         }
-        let step = text[pos.offset..]
-            .graphemes(true)
-            .next()
-            .map_or(0, str::len);
+        let step = text[pos.offset..].graphemes(true).next().map_or(0, str::len);
         Pos::new(pos.block, pos.offset + step)
+    }
+
+    /// Markdown for export. Underline and highlight have no Markdown syntax
+    /// and are written as plain text.
+    pub fn to_markdown(&self) -> String {
+        let mut out = String::new();
+        let mut number = 0;
+        for (i, block) in self.blocks.iter().enumerate() {
+            let list = matches!(block.kind, BlockKind::Bullet | BlockKind::Numbered);
+            let prev_list = i > 0 && matches!(self.blocks[i - 1].kind, BlockKind::Bullet | BlockKind::Numbered);
+            if i > 0 {
+                out.push_str(if list && prev_list { "\n" } else { "\n\n" });
+            }
+            number = if block.kind == BlockKind::Numbered { number + 1 } else { 0 };
+            match block.kind {
+                BlockKind::Heading(1) => out.push_str("# "),
+                BlockKind::Heading(_) => out.push_str("## "),
+                BlockKind::Bullet => out.push_str("- "),
+                BlockKind::Numbered => out.push_str(&format!("{number}. ")),
+                BlockKind::Quote => out.push_str("> "),
+                BlockKind::Paragraph => {}
+            }
+            for span in &block.spans {
+                let mut wrap = String::new();
+                if span.marks.contains(Marks::BOLD) {
+                    wrap.push_str("**");
+                }
+                if span.marks.contains(Marks::ITALIC) {
+                    wrap.push('_');
+                }
+                if span.marks.contains(Marks::STRIKE) {
+                    wrap.push_str("~~");
+                }
+                // Emphasis markers must hug the text, so surrounding spaces move outside.
+                let text = escape_markdown(&span.text);
+                let trimmed = text.trim();
+                if wrap.is_empty() || trimmed.is_empty() {
+                    out.push_str(&text);
+                    continue;
+                }
+                let lead = &text[..text.len() - text.trim_start().len()];
+                let trail = &text[text.trim_end().len()..];
+                let closing: String = wrap.chars().rev().collect();
+                out.push_str(&format!("{lead}{wrap}{trimmed}{closing}{trail}"));
+            }
+        }
+        out.push('\n');
+        out
     }
 
     /// Byte offset of `pos` in [`Document::plain_text`], where blocks are
     /// joined by `\n`. Platform text input (IME) addresses text this way.
     pub fn flat_offset(&self, pos: Pos) -> usize {
-        self.blocks[..pos.block]
-            .iter()
-            .map(|b| b.len() + 1)
-            .sum::<usize>()
-            + pos.offset
+        self.blocks[..pos.block].iter().map(|b| b.len() + 1).sum::<usize>() + pos.offset
     }
 
     /// Inverse of [`Document::flat_offset`], clamped to the document.
@@ -372,15 +374,22 @@ impl Document {
         (start.block..=end.block)
             .map(|i| {
                 let s = if i == start.block { start.offset } else { 0 };
-                let e = if i == end.block {
-                    end.offset
-                } else {
-                    self.blocks[i].len()
-                };
+                let e = if i == end.block { end.offset } else { self.blocks[i].len() };
                 (i, s, e)
             })
             .collect()
     }
+}
+
+fn escape_markdown(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if matches!(ch, '\\' | '*' | '_' | '~' | '`') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -419,10 +428,7 @@ mod tests {
 
     #[test]
     fn heading_split_tail_is_paragraph() {
-        let mut doc = Document {
-            title: "t".into(),
-            blocks: vec![Block::new(BlockKind::Heading(1), "Title")],
-        };
+        let mut doc = Document { title: "t".into(), blocks: vec![Block::new(BlockKind::Heading(1), "Title")] };
         doc.split_block(Pos::new(0, 5));
         assert_eq!(doc.blocks[1].kind, BlockKind::Paragraph);
     }
@@ -437,11 +443,7 @@ mod tests {
         assert!(spans[1].marks.contains(Marks::BOLD));
 
         doc.toggle_mark(Pos::new(0, 7), Pos::new(0, 4), Marks::BOLD);
-        assert_eq!(
-            doc.blocks[0].spans.len(),
-            1,
-            "spans merge back after unbolding"
-        );
+        assert_eq!(doc.blocks[0].spans.len(), 1, "spans merge back after unbolding");
     }
 
     #[test]
@@ -479,14 +481,31 @@ mod tests {
     }
 
     #[test]
+    fn markdown_export() {
+        let mut doc = Document {
+            title: "t".into(),
+            blocks: vec![
+                Block::new(BlockKind::Heading(1), "Title"),
+                Block::new(BlockKind::Paragraph, "Some bold words *literally*"),
+                Block::new(BlockKind::Bullet, "a"),
+                Block::new(BlockKind::Bullet, "b"),
+                Block::new(BlockKind::Numbered, "one"),
+                Block::new(BlockKind::Numbered, "two"),
+                Block::new(BlockKind::Quote, "q"),
+            ],
+        };
+        doc.toggle_mark(Pos::new(1, 4), Pos::new(1, 10), Marks::BOLD);
+        doc.toggle_mark(Pos::new(1, 10), Pos::new(1, 15), Marks::ITALIC);
+        assert_eq!(
+            doc.to_markdown(),
+            "# Title\n\nSome **bold** _words_ \\*literally\\*\n\n- a\n- b\n1. one\n2. two\n\n> q\n"
+        );
+    }
+
+    #[test]
     fn flat_offsets_round_trip() {
         let doc = Document::from_plain_text("t", "ab\n\ncde");
-        for (pos, flat) in [
-            (Pos::new(0, 2), 2),
-            (Pos::new(1, 0), 3),
-            (Pos::new(2, 1), 5),
-            (Pos::new(2, 3), 7),
-        ] {
+        for (pos, flat) in [(Pos::new(0, 2), 2), (Pos::new(1, 0), 3), (Pos::new(2, 1), 5), (Pos::new(2, 3), 7)] {
             assert_eq!(doc.flat_offset(pos), flat);
             assert_eq!(doc.pos_at_flat(flat), pos);
         }
