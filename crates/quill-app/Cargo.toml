@@ -36,7 +36,6 @@ harness = false
 required-features = ["screenshots"]
 
 [dev-dependencies]
-quill-spell = { path = "../quill-spell" }
 tempfile = "3.27.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
